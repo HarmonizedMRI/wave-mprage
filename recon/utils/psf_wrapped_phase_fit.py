@@ -22,6 +22,10 @@ result = fit_wrapped_phase_planes(
     use_residual_coherence_refinement=True,
     return_quality_maps=True,
 )
+
+Author: Yiyun Dong
+Affiliation: Athinoula A. Martinos Center for Biomedical Imaging
+License: MIT License
 """
 
 from __future__ import annotations

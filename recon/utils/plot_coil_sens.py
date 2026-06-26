@@ -1,3 +1,25 @@
+"""Coil-sensitivity plotting helpers.
+
+This module provides lightweight Matplotlib utilities for visualizing
+coil sensitivity maps (CSMs) estimated during MRI reconstruction. The
+functions assume coil-first CSM arrays with shape ``(ncoils, nx, ny, nz)``
+and plot either magnitude or phase for a selected axial slice.
+
+Typical usage
+-------------
+    from utils.plot_coil_sens import plot_csm_magnitude_grid, plot_csm_phase_grid
+
+    plot_csm_magnitude_grid(csm_full_cc_np, z=csm_full_cc_np.shape[-1] // 2)
+    plot_csm_phase_grid(csm_full_cc_np, z=csm_full_cc_np.shape[-1] // 2)
+
+Notes
+-----
+- Magnitude plots use a percentile-based display maximum for robust scaling.
+- Phase plots mask low-RSS background before displaying phase in ``[-pi, pi]``.
+- These helpers are intended for quick quality-control figures, not for
+  quantitative analysis.
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 

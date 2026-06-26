@@ -1,3 +1,15 @@
+#!/usr/bin/env python3
+"""Wave-MPRAGE reconstruction from Siemens TWIX data.
+
+Author: Yiyun Dong
+Affiliation: Athinoula A. Martinos Center for Biomedical Imaging
+License: MIT License
+
+Description:
+    Reconstruct Wave-MPRAGE or no-wave MPRAGE data from Siemens TWIX files
+    using coil compression, ESPIRiT coil sensitivity estimation, and CG-SENSE + WAVE PSF Calibration from FLASH sequence.
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
@@ -7,6 +19,7 @@ import pypulseq as pp
 
 import platform
 import os
+import argparse
 
 import cupy as cp
 import sigpy as sp
@@ -36,15 +49,15 @@ plt.rcParams.update({
 })
 
 def main():
-    # Check if data_folder, out_folder, mprage_data_file, mprage_seq_file, calib_data_file, calib_seq_file, file_tag exist as variable names. If not
-    # To-Do: prompt user for data_folder that contains the twix .dat data
-    # To-Do: prompt user for out_folder that saves the output .npy
-    # To-Do: prompt user for mprage_data_file for the wave MPRAGE data
-    # To-Do: prompt user for mprage_seq_file for the wave MPRAGE sequence
-    # To-Do: prompt user for calib_data_file for the wave calibration data
-    # To-Do: prompt user for calib_seq_file for the wave calibration sequence
-    # To-Do: prompt user for file_tag for the special file name suffix
-    # To-Do: prompt user for whether this is wave recon [yes for wave, no for nowave] so that [tag_wave = 'wave' or 'nowave']
+    cfg = _collect_runtime_config()
+    data_folder = cfg["data_folder"]
+    out_folder = cfg["out_folder"]
+    mprage_data_file = cfg["mprage_data_file"]
+    mprage_seq_file = cfg["mprage_seq_file"]
+    calib_data_file = cfg["calib_data_file"]
+    calib_seq_file = cfg["calib_seq_file"]
+    file_tag = cfg["file_tag"]
+    tag_wave = cfg["tag_wave"]
 
     seq = pp.Sequence()
     seq.read(mprage_seq_file, remove_duplicates=False)
@@ -71,7 +84,8 @@ def main():
     kspace_echo[:, :img.shape[1], :img.shape[2], :, :] = img
 
     kspace_cc_echo = apply_cc_coillast_torch(kspace_echo, Wcc, x_chunk=8,)
-    np.save(out_folder + 'kspace_' + tag_wave + '_cc_'+str(res_x)+'x'+str(res_y)+'x'+str(res_z)+'_Ry'+str(Ry)+'_Rz'+str(Rz)+'_' + file_tag, kspace_cc_echo)
+    kspace_cc_file = out_folder + 'kspace_' + tag_wave + '_cc_'+str(res_x)+'x'+str(res_y)+'x'+str(res_z)+'_Ry'+str(Ry)+'_Rz'+str(Rz)+'_' + file_tag
+    _save_npy(kspace_cc_file, kspace_cc_echo, 'coil-compressed k-space')
 
     # Use ESPIRiT maps estimated above
     sens = torch.zeros((12, Nx_os, Ny, Nz), dtype=torch.complex64)
@@ -89,8 +103,9 @@ def main():
         y_meas = kspace_cc_echo.permute(3,0,1,2)  # (ncoil, Nx_os, Ny, Nz)
 
         # generate calibrated psf
-        print("Generated calibrated psf")
-        psf_calib, psf_theory = generate_calibrated_psf(calib_data_file, calib_seq_file, out_folder, Nx_os, Ny, Nz, yflip = -1, zflip = -1)  # Use yflip, zflip = -1 for 'SAG', 1 for 'TRA'
+        print("Generating calibrated PSF...")
+        psf_calib, psf_theory = generate_calibrated_psf(calib_data_file, calib_seq_file, out_folder, Nx_os, Ny, Nz, file_tag=file_tag, yflip = -1, zflip = -1)  # Use yflip, zflip = -1 for 'SAG', 1 for 'TRA'
+        print("Generated calibrated PSF")
 
         psf_to_use = psf_calib.clone()
         # psf_to_use = psf_theory.clone()
@@ -107,8 +122,8 @@ def main():
             use_direct_if_full=True,
         )
 
-        # To-Do: Print saving to filename 'xxx' (further development will provide option to save to nifti)
-        np.save(out_folder + 'image_cg_wave_calib_' +str(res_x)+'x'+str(res_y)+'x'+str(res_z)+'_Ry'+str(Ry)+'_Rz'+str(Rz) + '_' + file_tag, img_pcg_wave)
+        image_wave_file = out_folder + 'image_cg_wave_calib_' +str(res_x)+'x'+str(res_y)+'x'+str(res_z)+'_Ry'+str(Ry)+'_Rz'+str(Rz) + '_' + file_tag
+        _save_npy(image_wave_file, img_pcg_wave, 'wave CG-SENSE image')
     
     elif tag_wave == 'nowave':  # reconstruct nowave image 
         # Perform CG SENSE for no wave
@@ -158,8 +173,8 @@ def main():
         y_meas = kspace_cc_echo.permute(3,0,1,2)  # (ncoil, Nx_os, Ny, Nz)
 
         img_cg_nowave = cg_sense(y_meas, n_iter=50, tol=1e-6)
-        # To-Do: Print saving to filename 'xxx' (further development will provide option to save to nifti)
-        np.save(out_folder + 'image_cg_nowave_' +str(res_x)+'x'+str(res_y)+'x'+str(res_z)+'_Ry'+str(Ry)+'_Rz'+str(Rz)+'_' + file_tag, img_cg_nowave)
+        image_nowave_file = out_folder + 'image_cg_nowave_' +str(res_x)+'x'+str(res_y)+'x'+str(res_z)+'_Ry'+str(Ry)+'_Rz'+str(Rz)+'_' + file_tag
+        _save_npy(image_nowave_file, img_cg_nowave, 'no-wave CG-SENSE image')
 
 
 def generate_coil_sens(calib_data_file, Ny, Nz, os_factor, out_folder, file_tag):
@@ -369,7 +384,13 @@ def generate_calibrated_psf(calib_data_file, calib_seq_file, out_folder, Nx_os, 
     kspace_nowave_cos = kspace_calib_data[:,:1,:,2]
     kspace_wave_cos = kspace_calib_data[:,:1,:,3]
 
-    # To-Do: check if kspace_calib_data.shape[0] matches Nx_os, if not, raise Error that the oversampled readout dimension doesn't match
+    if kspace_calib_data.shape[0] != Nx_os:
+        raise ValueError(
+            f'Oversampled readout dimension mismatch: calibration data has '
+            f'{kspace_calib_data.shape[0]} samples, but the MPRAGE sequence expects Nx_os={Nx_os}. '
+            f'Check Nx/ro_os and make sure the calibration data matches the MPRAGE sequence.'
+        )
+    print(f'Calibration readout dimension check passed: Nx_os = {Nx_os}')
 
     # generate theoretical wave trajectory
     seq = pp.Sequence()
@@ -431,6 +452,174 @@ def generate_calibrated_psf(calib_data_file, calib_seq_file, out_folder, Nx_os, 
     psf_diff_pred_new = torch.nan_to_num(psf_diff_pred_new.clone(), nan=0.0)
     psf_calib = psf_theory * torch.exp(1j*psf_diff_pred_new)
     return psf_calib, psf_theory
+
+
+
+
+def _parse_cli_args():
+    """Parse optional command-line arguments while tolerating notebook extras."""
+    parser = argparse.ArgumentParser(
+        description="Reconstruct Wave-MPRAGE/no-wave MPRAGE data from Siemens TWIX files."
+    )
+    parser.add_argument("--data-folder", default=None, help="Folder containing input .dat/.seq files.")
+    parser.add_argument("--out-folder", default=None, help="Folder where output .npy/.png files are saved.")
+    parser.add_argument("--mprage-data-file", default=None, help="Wave/no-wave MPRAGE TWIX .dat file.")
+    parser.add_argument("--mprage-seq-file", default=None, help="Wave/no-wave MPRAGE Pulseq .seq file.")
+    parser.add_argument("--calib-data-file", default=None, help="Wave calibration TWIX .dat file.")
+    parser.add_argument("--calib-seq-file", default=None, help="Wave calibration Pulseq .seq file.")
+    parser.add_argument("--file-tag", default=None, help="Suffix tag used in output filenames.")
+    parser.add_argument("--tag-wave", choices=("wave", "nowave"), default=None,
+                        help="Reconstruction type: 'wave' or 'nowave'.")
+    args, _ = parser.parse_known_args()
+    return args
+
+
+def _prompt_for_value(name, prompt_text, default=None, required=True):
+    """Read a value from globals, otherwise from stdin or a default."""
+    if name in globals() and globals()[name] not in (None, ""):
+        value = globals()[name]
+        print(f"Using {name}: {value}")
+        return value
+
+    if default not in (None, ""):
+        print(f"Using {name}: {default}")
+        return default
+
+    try:
+        value = input(f"{prompt_text}: ").strip()
+    except EOFError as exc:
+        if required:
+            raise ValueError(
+                f"Missing required input '{name}'. Provide it as a global variable, "
+                f"a command-line argument, or run interactively to enter it at the prompt."
+            ) from exc
+        return None
+
+    if required and value == "":
+        raise ValueError(f"Missing required input '{name}'.")
+    return value
+
+
+def _normalize_folder(folder):
+    """Expand, create, and return a folder path with a trailing separator."""
+    folder = os.path.abspath(os.path.expanduser(os.path.expandvars(str(folder))))
+    os.makedirs(folder, exist_ok=True)
+    return folder if folder.endswith(os.sep) else folder + os.sep
+
+
+def _resolve_input_path(path_value, data_folder, label):
+    """Resolve an input file path relative to data_folder and verify it exists."""
+    path_value = os.path.expanduser(os.path.expandvars(str(path_value)))
+    if data_folder and not os.path.isabs(path_value):
+        path_value = os.path.join(data_folder, path_value)
+    path_value = os.path.abspath(path_value)
+    if not os.path.isfile(path_value):
+        raise FileNotFoundError(f"{label} not found: {path_value}")
+    print(f"Using {label}: {path_value}")
+    return path_value
+
+
+def _parse_wave_tag(value):
+    """Normalize wave/no-wave user input."""
+    value = str(value).strip().lower()
+    if value in ("wave", "w", "yes", "y", "true", "1"):
+        return "wave"
+    if value in ("nowave", "no-wave", "no_wave", "nw", "no", "n", "false", "0"):
+        return "nowave"
+    raise ValueError("tag_wave must be 'wave' or 'nowave' (yes/no is also accepted interactively).")
+
+
+def _npy_output_path(path_without_ext):
+    """Return the exact .npy filename that will be written."""
+    path_without_ext = str(path_without_ext)
+    return path_without_ext if path_without_ext.endswith(".npy") else path_without_ext + ".npy"
+
+
+def _save_npy(path_without_ext, array, label):
+    """Save a NumPy/PyTorch object and print the exact output path."""
+    out_path = _npy_output_path(path_without_ext)
+    print(f"Saving {label} to: {out_path}")
+    np.save(out_path, array)
+    return out_path
+
+
+def _collect_runtime_config():
+    """Collect runtime paths/tags from CLI args, existing globals, or prompts."""
+    cli = _parse_cli_args()
+
+    data_folder_value = _prompt_for_value(
+        "data_folder",
+        "Folder containing the TWIX .dat and Pulseq .seq files",
+        default=cli.data_folder,
+    )
+    data_folder_value = os.path.abspath(os.path.expanduser(os.path.expandvars(str(data_folder_value))))
+
+    out_folder_value = _prompt_for_value(
+        "out_folder",
+        "Folder for output .npy/.png files",
+        default=cli.out_folder,
+    )
+    out_folder_value = _normalize_folder(out_folder_value)
+
+    mprage_data_value = _prompt_for_value(
+        "mprage_data_file",
+        "Wave/no-wave MPRAGE TWIX .dat file",
+        default=cli.mprage_data_file,
+    )
+    mprage_seq_value = _prompt_for_value(
+        "mprage_seq_file",
+        "Wave/no-wave MPRAGE Pulseq .seq file",
+        default=cli.mprage_seq_file,
+    )
+    calib_data_value = _prompt_for_value(
+        "calib_data_file",
+        "Wave calibration TWIX .dat file",
+        default=cli.calib_data_file,
+    )
+    calib_seq_value = _prompt_for_value(
+        "calib_seq_file",
+        "Wave calibration Pulseq .seq file",
+        default=cli.calib_seq_file,
+    )
+    file_tag_value = _prompt_for_value(
+        "file_tag",
+        "Output filename suffix/file tag",
+        default=cli.file_tag,
+    )
+
+    tag_default = cli.tag_wave
+    if tag_default is None and "tag_wave" in globals() and globals()["tag_wave"] not in (None, ""):
+        tag_default = globals()["tag_wave"]
+    if tag_default is None:
+        tag_default = _prompt_for_value(
+            "tag_wave",
+            "Reconstruct wave data? Enter yes/wave or no/nowave",
+            default=None,
+        )
+    tag_wave_value = _parse_wave_tag(tag_default)
+    print(f"Using tag_wave: {tag_wave_value}")
+
+    mprage_data_value = _resolve_input_path(mprage_data_value, data_folder_value, "MPRAGE data file")
+    mprage_seq_value = _resolve_input_path(mprage_seq_value, data_folder_value, "MPRAGE sequence file")
+    calib_data_value = _resolve_input_path(calib_data_value, data_folder_value, "calibration data file")
+    calib_seq_value = _resolve_input_path(calib_seq_value, data_folder_value, "calibration sequence file")
+
+    print("Runtime configuration summary:")
+    print(f"  data_folder:      {data_folder_value}")
+    print(f"  out_folder:       {out_folder_value}")
+    print(f"  file_tag:         {file_tag_value}")
+    print(f"  reconstruction:   {tag_wave_value}")
+
+    return {
+        "data_folder": data_folder_value,
+        "out_folder": out_folder_value,
+        "mprage_data_file": mprage_data_value,
+        "mprage_seq_file": mprage_seq_value,
+        "calib_data_file": calib_data_value,
+        "calib_seq_file": calib_seq_value,
+        "file_tag": str(file_tag_value),
+        "tag_wave": tag_wave_value,
+    }
 
 
 if __name__ == "__main__":

@@ -23,6 +23,10 @@ Defaults are conservative:
     - use_direct_if_full=False
 
 So the default CG behavior remains close to the original solver.
+
+Author: Yiyun Dong
+Affiliation: Athinoula A. Martinos Center for Biomedical Imaging
+License: MIT License
 """
 
 import torch

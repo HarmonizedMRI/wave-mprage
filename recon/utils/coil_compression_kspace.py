@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 MRI k-space coil-compression helpers.
 
