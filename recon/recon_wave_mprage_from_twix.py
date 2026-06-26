@@ -8,6 +8,9 @@ License: MIT License
 Description:
     Reconstruct Wave-MPRAGE or no-wave MPRAGE data from Siemens TWIX files
     using coil compression, ESPIRiT coil sensitivity estimation, and CG-SENSE + WAVE PSF Calibration from FLASH sequence.
+
+Note: 
+    Future update involves 'retro LR recon' and 'save_to_nifti option'
 """
 
 import numpy as np
