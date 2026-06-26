@@ -1,3 +1,10 @@
+% forbiddenFreqCheck.m
+% Author: Yiyun Dong
+% Affiliation: Athinoula A. Martinos Center for Biomedical Imaging
+% Date: 2026-06-26
+
+% Helper function to plot the gradient frequency spectrum and check the forbidden frequency range based on scanner asc file
+
 function forbiddenFreqCheck(seq, sys, ascName)
     seq.gradSpectrum(ascName);  % use method API: gradSpectrum(obj, FB_or_ascFile, [fmax], [doPlot])
 
