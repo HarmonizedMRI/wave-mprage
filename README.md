@@ -1,6 +1,6 @@
 # Wave MPRAGE
 
-Pulseq-based 3D Wave MPRAGE sequence development and reconstruction code.
+Pulseq-based 3D Wave MPRAGE sequence generation with integrated FLASH wave calibration and Python reconstruction utilities.
 
 The MPRAGE sequence is built based on Maxim's Pulseq MPRAGE demo:
 `matlab/demoSeq/writeMPRAGE.m` from the Pulseq MATLAB toolbox.
@@ -10,82 +10,294 @@ The MPRAGE sequence is built based on Maxim's Pulseq MPRAGE demo:
 ```text
 .
 ├── README.md
+├── .gitignore
 ├── seq/
-│   ├── mprage_3d_wave.m              # Wave MPRAGE sequence
-│   ├── flash_wave_calibration.m       # FLASH partial-k-space sequence for wave PSF calibration
-│   └── utils/                         # Sequence utility functions
+│   ├── mprage_3d_wave_with_flash_calibration.m
+│   └── utils/
+│       ├── configurePathSettings.m
+│       ├── defineCosineWaveGradient.m
+│       ├── defineSineWaveGradient.m
+│       └── ...
 └── recon/
-    ├── recon_wave_mprage_from_twix.py # Wave/no-wave MPRAGE reconstruction from Siemens TWIX data
-    └── utils/                         # Reconstruction utility functions
+    ├── recon_wave_mprage_from_twix.py
+    └── utils/
 ```
 
-### `seq/mprage_3d_wave.m`
+The repository may also retain earlier standalone MPRAGE and FLASH calibration scripts for development or comparison. The recommended sequence generator is:
 
-Main Wave MPRAGE sequence generator.
+```text
+seq/mprage_3d_wave_with_flash_calibration.m
+```
 
-The script supports interactive path setup for:
-- Pulseq MATLAB toolbox
-- optional Safe PNS prediction toolbox
-- output directory
-- optional scanner `.asc` file for PNS/CNS and forbidden-frequency checks
+## Integrated MPRAGE + FLASH sequence
 
-The sequence writes the `.seq` file before optional safety/frequency checks, so sequence generation can still proceed if the optional checking dependencies are not available.
+### Acquisition order
 
-### `seq/flash_wave_calibration.m`
+The integrated sequence contains two acquisitions in this order:
 
-FLASH calibration sequence for wave PSF calibration.
+1. MPRAGE image acquisition
+2. FLASH calibration acquisition, including dummy scans and per-part settling
 
-Make sure the following settings are consistent with `mprage_3d_wave.m`:
-- geometry
-- FOV
-- matrix size
-- orientation
-- readout duration and oversampling
-- wave amplitude
-- number of wave cycles
-- sine/cosine wave settings
+The MPRAGE acquisition is placed first so that the continuous FLASH calibration train does not alter the longitudinal magnetization immediately before the first MPRAGE inversion block.
 
-### `seq/utils/`
+### Shared settings
 
-Utility functions used by the sequence scripts, including helper code for optional forbidden-frequency checks.
+The MPRAGE and FLASH calibration sections share the following settings:
+
+- flip angle `alpha`
+- readout duration `ro_dur`
+- readout oversampling `ro_os`
+- readout spoiling `ro_spoil`
+- RF-spoiling increment `rfSpoilingInc`
+- RF duration `rfLen`
+- sagittal axis definition and axis order
+- FOV and matrix size
+- wave amplitude `gwave_max`
+- wave slew limit `swave_max`
+- number of wave cycles `Ncycles`
+- scanner and Pulseq system limits
+
+The integrated script currently supports:
+
+```matlab
+slOrientation = 'SAG';
+ax.d1 = 'z';  % readout
+ax.d2 = 'x';  % inner PE / PAR
+ax.d3 = 'y';  % outer PE / LIN
+```
+
+The MPRAGE-specific flags default to:
+
+```matlab
+isUseWave_cos = true;
+isUseWave_sin = true;
+```
+
+The FLASH calibration always generates its required no-wave, sine-wave, and cosine-wave acquisitions from the same shared wave-event library.
+
+### TWIX routing
+
+The combined measurement stores MPRAGE and FLASH calibration data in different TWIX containers:
+
+| Acquisition | `REF` | `IMA` | `SET` | TWIX destination |
+|---|---:|---:|---:|---|
+| MPRAGE image | `false` | `false` | `0` | `image` |
+| FLASH calibration | `true` | `false` | `0`–`4` | `refscan` |
+
+MPRAGE does not acquire a separate ACS block. Its acquired k-space is stored only in `image`.
+
+Every acquired FLASH calibration ADC is marked as a reference scan and is stored in `refscan`.
+
+### FLASH calibration SET layout
+
+The calibration uses compact local `LIN` and `PAR` indices inside each `SET`:
+
+| SET | Acquisition | Local size |
+|---:|---|---|
+| 0 | no-wave, ky-wide / kz-narrow | `Ncalib1 × Ncalib2` |
+| 1 | sine-wave, ky-wide / kz-narrow | `Ncalib1 × Ncalib2` |
+| 2 | no-wave, kz-wide / ky-narrow | `Ncalib2 × Ncalib1` |
+| 3 | cosine-wave, kz-wide / ky-narrow | `Ncalib2 × Ncalib1` |
+| 4 | no-wave ACS | `Nacs × Nacs` |
+
+With the default settings:
+
+```matlab
+Ncalib1 = 72;
+Ncalib2 = 1;
+Nacs    = 32;
+```
+
+the expected logical refscan extent is:
+
+```text
+LIN × PAR × SET = 72 × 72 × 5
+```
+
+Unacquired positions remain zero. The ACS data occupies local indices:
+
+```text
+LIN = 0:31
+PAR = 0:31
+SET = 4
+```
+
+### Validation performed by the script
+
+Before writing the sequence, the script checks that:
+
+- MPRAGE has no separate ACS acquisition
+- MPRAGE ADCs are routed exclusively to `image`
+- all five FLASH calibration sets are routed exclusively to `refscan`
+- MPRAGE uses `SET=0`, `REF=false`, and `IMA=false`
+- calibration uses `REF=true` and `IMA=false`
+- calibration `SET`, `PAR`, and `LIN` order matches the requested acquisition table
+- ACS occupies the expected local block in `SET=4`
+- MPRAGE PE sampling matches the requested acceleration pattern
+- combined `SET/PAR/LIN/REF/IMA` label evolution is correct
+- sequence timing passes `seq.checkTiming`
+
+The sequence is written before the optional PNS/CNS and forbidden-frequency checks.
+
+## Path settings
+
+### Local JSON configuration
+
+Path settings are managed by:
+
+```text
+seq/utils/configurePathSettings.m
+```
+
+The following settings are saved locally:
+
+- `pulseq_path`
+- `safe_pns_prediction_path`
+- `out_path`
+- `system_asc_file`
+
+The settings are written beside the main MATLAB script as:
+
+```text
+mprage_flash_path_settings.json
+```
+
+On the first run, the script prompts for all path settings and saves them.
+
+On later runs, the script asks whether to use the saved settings. When saved settings are reused, it also asks whether any path should be changed. One, multiple, or all path entries can be selected for editing.
+
+For optional settings:
+
+```text
+-
+```
+
+clears the saved path.
+
+For the target output path, pressing Enter without entering a path uses MATLAB's current folder:
+
+```matlab
+pwd
+```
+
+Existing MATLAB workspace values are shown as defaults when path settings are configured.
+
+Long saved paths are printed separately from `input()`. The interactive prompts use short lines such as `Path:`, `File:`, and `Choice:` to avoid MATLAB Command Window wrapping and cursor misalignment.
+
+### Generated sequence folders
+
+Generated files are written under the selected output root:
+
+```text
+generated_seq_v141/
+generated_seq_v151/
+```
+
+The behavior is controlled by:
+
+```matlab
+write_v141_format
+```
+
+- `true`: write both legacy Pulseq v1.4.1 and current-format sequence files
+- `false`: write only the current-format sequence file
+
+When `write_v141_format=true`, output is organized as:
+
+```text
+<out_path>/
+├── generated_seq_v141/
+│   └── <sequence_name>_v141.seq
+└── generated_seq_v151/
+    └── <sequence_name>.seq
+```
+
+### Git exclusions
+
+The following local or generated content should be ignored by Git:
+
+```gitignore
+mprage_flash_path_settings.json
+generated_seq_v141/
+generated_seq_v151/
+```
+
+Merge these entries into the repository `.gitignore` if it already contains other rules.
+
+## Sequence utilities
+
+All local functions used by the original MPRAGE and FLASH calibration scripts were moved into `seq/utils/`.
+
+Shared waveform helpers include:
+
+- `defineCosineWaveGradient.m`
+- `defineSineWaveGradient.m`
+- `makeFixedDurationPreRamp.m`
+- `makeExtendedTrapezoidAndWaveform.m`
+
+MPRAGE scheduling helpers include fixed-ETL planning, segmented block construction, center-slot enforcement, PE sampling, and label validation utilities.
+
+The repository intentionally does not provide a replacement for:
+
+```text
+forbiddenFreqCheck.m
+```
+
+The integrated script expects the existing helper to be available under `seq/utils/` or elsewhere on the MATLAB path.
+
+## Reconstruction
 
 ### `recon/recon_wave_mprage_from_twix.py`
 
 Python reconstruction script for Siemens TWIX data.
 
 The reconstruction workflow includes:
-- loading Wave MPRAGE or no-wave MPRAGE TWIX data
-- loading FLASH wave-calibration TWIX data
+
+- loading Wave MPRAGE or no-wave MPRAGE data
+- loading FLASH wave-calibration data
 - estimating coil-compression weights from calibration data
 - estimating ESPIRiT coil sensitivity maps
 - generating a calibrated wave PSF from the FLASH calibration data
 - reconstructing wave data with wave CG-SENSE
 - reconstructing no-wave data with standard CG-SENSE
-- saving intermediate coil-compressed k-space, coil maps, PSF diagnostics, and reconstructed images as `.npy`/`.png` outputs
+- saving intermediate coil-compressed k-space, coil maps, PSF diagnostics, and reconstructed images as `.npy` and `.png` outputs
 
-The current reconstruction output is saved as NumPy files. NIfTI export can be added downstream if needed.
+For the integrated acquisition, the TWIX measurement contains:
+
+```text
+image   -> MPRAGE k-space
+refscan -> FLASH calibration k-space
+```
+
+The matching integrated `.seq` file contains the metadata for both acquisition parts.
+
+The current reconstruction output is saved as NumPy files. NIfTI export can be performed downstream when needed.
 
 ### `recon/utils/`
 
-Utility functions used by the reconstruction script, including TWIX import, coil compression, coil sensitivity plotting, PSF phase fitting, and wave CG-SENSE helper functions.
+Reconstruction helper functions include TWIX import, coil compression, coil-sensitivity plotting, PSF phase fitting, and wave CG-SENSE operations.
 
 ## Prerequisites
 
 ### Sequence generation
 
 Required:
+
 - MATLAB
 - Pulseq MATLAB toolbox
 
 Optional:
+
 - [Safe PNS prediction](https://github.com/filip-szczepankiewicz/safe_pns_prediction), for PNS/CNS checks
-- Scanner `.asc` file, for PNS/CNS and forbidden-frequency checks
+- scanner `.asc` file, for PNS/CNS and forbidden-frequency checks
+- an existing `forbiddenFreqCheck.m` helper
 
 The optional checks can be skipped when running the sequence script.
 
 ### Reconstruction
 
 Required:
+
 - Python 3.9 or newer recommended
 - NumPy
 - SciPy
@@ -94,19 +306,22 @@ Required:
 - CuPy
 - SigPy
 - pypulseq
-- an NVIDIA GPU visible to CuPy/SigPy/PyTorch
+- an NVIDIA GPU visible to CuPy, SigPy, and PyTorch
 - the repository `recon/utils/` modules available on the Python path
 
-The reconstruction code uses the GPU for coil-compression-related processing and ESPIRiT calibration through CuPy/SigPy. Before running the reconstruction, make sure the following components are mutually compatible:
+The reconstruction code uses the GPU for coil-compression-related processing and ESPIRiT calibration through CuPy and SigPy.
+
+Before running the reconstruction, make sure the following components are mutually compatible:
+
 - Linux `glibc` version
 - NVIDIA GPU model and compute capability
 - NVIDIA driver version
-- CUDA runtime/toolkit version
-- CuPy package/build, for example the correct `cupy-cudaXX` package
+- CUDA runtime or toolkit version
+- CuPy package and CUDA build, such as the correct `cupy-cudaXX` package
 - SigPy version
 - PyTorch version and PyTorch CUDA build
 
-Version mismatches commonly appear as errors such as missing `GLIBC_x.y`, CUDA runtime/library load failures, GPU device initialization failures, or CuPy/PyTorch CUDA-version conflicts. Use a clean conda or virtualenv environment and install CuPy/PyTorch builds that match the CUDA version supported by your driver and system.
+Version mismatches commonly appear as missing `GLIBC_x.y` errors, CUDA library-load failures, GPU initialization failures, or CuPy/PyTorch CUDA-version conflicts. A clean conda or virtual environment is recommended.
 
 ## Installing dependencies
 
@@ -114,52 +329,44 @@ Version mismatches commonly appear as errors such as missing `GLIBC_x.y`, CUDA r
 
 Pulseq is required, but this repository does not vendor Pulseq as a Git submodule.
 
-Install or clone Pulseq separately, then provide its path when running the sequence script. The script expects the Pulseq MATLAB folder to be available as:
+Install or clone Pulseq separately, then provide its repository root or MATLAB folder when prompted. The integrated script accepts either:
 
-```matlab
-addpath(fullfile(pulseq_path, 'matlab'));
+```text
+/path/to/pulseq
 ```
 
-For example:
+or:
 
-```matlab
-pulseq_path = '/path/to/pulseq';
+```text
+/path/to/pulseq/matlab
 ```
 
-If the public Pulseq GitHub repository is unavailable from your environment, use one of the following approaches:
-- use an existing local Pulseq installation
-- use a lab-maintained mirror or fork
-- download a released/source snapshot manually
-- provide `pulseq_path` interactively when prompted
+The script detects the location of the `+mr` package and adds the appropriate folder to the MATLAB path.
+
+If the public Pulseq repository is unavailable from the local environment, use an existing local installation, a lab-maintained mirror or fork, or a downloaded source snapshot.
 
 ### Safe PNS prediction
 
-Safe PNS prediction is optional. If it is not available, leave the path empty and skip PNS/CNS checks when prompted.
-
-Basic usage:
-
-```matlab
-safe_pns_prediction_path = fullfile(pwd, 'external', 'safe_pns_prediction');
-```
+Safe PNS prediction is optional. Leave the path empty or enter `-` to clear it when PNS/CNS checks are not needed.
 
 ### Python reconstruction environment
 
-Create a dedicated Python environment for reconstruction. The exact package versions depend on your local GPU, driver, CUDA, and `glibc` setup.
+Create a dedicated Python environment. Exact package versions depend on the local GPU, driver, CUDA, and `glibc` setup.
 
-Example using conda and pip:
+Example:
 
 ```bash
 conda create -n wave-mprage-recon python=3.10
 conda activate wave-mprage-recon
 
 pip install numpy scipy matplotlib pypulseq sigpy torch
-# Install the CuPy package that matches your CUDA environment, for example:
+# Install the CuPy package matching the local CUDA environment:
 # pip install cupy-cuda11x
 # or
 # pip install cupy-cuda12x
 ```
 
-After installation, verify that the GPU stack is visible from Python:
+Verify the GPU stack:
 
 ```bash
 python - <<'PY'
@@ -175,86 +382,78 @@ PY
 
 ## Basic usage
 
-### Generate the sequence
+### Generate the integrated sequence
 
-Clone this repository, open MATLAB, and run the sequence script from the `seq/` folder:
+Open MATLAB and run the integrated script from the `seq/` folder:
 
 ```matlab
 cd seq
-mprage_3d_wave
+mprage_3d_wave_with_flash_calibration
 ```
 
-The script will prompt for missing paths if they are not already defined in the MATLAB workspace.
+On the first run, configure the requested paths. The settings are saved locally for later runs.
 
-To avoid repeated prompts, define paths before running the script:
+On subsequent runs:
+
+1. choose whether to reuse the saved JSON settings
+2. choose whether any path setting should be changed
+3. select the individual entries to update when needed
+
+Leaving the output-path prompt blank uses the current MATLAB folder as the output root.
+
+The generated sequence filename includes the MPRAGE wave mode, matrix, resolution, ETL plan, acceleration factors, calibration size, ACS size, readout oversampling, wave settings, orientation, and scanner type.
+
+### Optional workspace defaults
+
+The path helper reads existing values from the MATLAB base workspace and presents them as defaults:
 
 ```matlab
 pulseq_path = '/path/to/pulseq';
 safe_pns_prediction_path = '/path/to/safe_pns_prediction';  % optional
-out_path = '/path/to/output/folder/';
+out_path = '/path/to/output/root';
 system_asc_file = '/path/to/scanner.asc';                   % optional
 
 cd seq
-mprage_3d_wave
+mprage_3d_wave_with_flash_calibration
 ```
+
+The interactive JSON workflow is still used, allowing saved or workspace paths to be reviewed and changed.
 
 ### Reconstruct Wave MPRAGE data
 
-Run the reconstruction script from the repository root or from the `recon/` folder. Provide the data folder, output folder, MPRAGE TWIX/sequence files, FLASH calibration TWIX/sequence files, output tag, and whether the dataset is wave or no-wave.
+Run the reconstruction script from the repository root or the `recon/` folder.
 
-Example wave reconstruction:
+The integrated sequence produces one TWIX measurement with MPRAGE in `image` and FLASH calibration in `refscan`. Reconstruction code should read the two containers from the same measurement.
 
-```bash
-cd recon
-python recon_wave_mprage_from_twix.py \
-  --data-folder /path/to/data \
-  --out-folder /path/to/recon_output \
-  --mprage-data-file wave_mprage.dat \
-  --mprage-seq-file wave_mprage.seq \
-  --calib-data-file flash_wave_calibration.dat \
-  --calib-seq-file flash_wave_calibration.seq \
-  --file-tag sub01_run01 \
-  --tag-wave wave
-```
-
-Example no-wave reconstruction:
+The exact command-line arguments depend on the current version of `recon_wave_mprage_from_twix.py`. Use:
 
 ```bash
-cd recon
-python recon_wave_mprage_from_twix.py \
-  --data-folder /path/to/data \
-  --out-folder /path/to/recon_output \
-  --mprage-data-file nowave_mprage.dat \
-  --mprage-seq-file nowave_mprage.seq \
-  --calib-data-file flash_wave_calibration.dat \
-  --calib-seq-file flash_wave_calibration.seq \
-  --file-tag sub01_run01 \
-  --tag-wave nowave
+python recon_wave_mprage_from_twix.py --help
 ```
 
-The script can also prompt interactively for missing paths and tags.
+to review its required file and reconstruction-mode arguments.
 
 ### Reconstruction inputs
 
-Required inputs:
-- Wave or no-wave MPRAGE TWIX `.dat` file
-- matching MPRAGE Pulseq `.seq` file
-- FLASH wave-calibration TWIX `.dat` file
-- matching FLASH wave-calibration Pulseq `.seq` file
+For the integrated acquisition, the core inputs are:
+
+- combined MPRAGE + FLASH calibration TWIX `.dat` file
+- matching integrated Pulseq `.seq` file
 - output folder
 - output filename tag
 - reconstruction mode: `wave` or `nowave`
 
-The MPRAGE and calibration data should use compatible geometry, FOV, matrix size, orientation, readout oversampling, readout duration, and wave settings.
+The MPRAGE and calibration portions automatically share geometry, FOV, matrix size, orientation, readout oversampling, readout duration, RF settings, wave amplitude, and number of wave cycles because they are generated by the same sequence script.
 
 ### Reconstruction outputs
 
-The reconstruction script writes outputs to `out_folder`, including:
-- coil-compression matrix/energy files
+The reconstruction script writes outputs to the selected output folder, including:
+
+- coil-compression matrix and energy files
 - coil sensitivity maps
 - coil sensitivity magnitude and phase plots
 - coil-compressed MPRAGE k-space
-- PSF calibration fit files and diagnostic plots for wave reconstruction
-- reconstructed image array for wave or no-wave reconstruction
+- PSF calibration fits and diagnostic plots for wave reconstruction
+- reconstructed wave or no-wave image arrays
 
-Output filenames include the resolution, acceleration factors, reconstruction mode, and `file_tag` when available.
+Output filenames include the resolution, acceleration factors, reconstruction mode, and user-provided file tag when available.
