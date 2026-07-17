@@ -892,6 +892,9 @@ seq.setDefinition('ResolutionZ_mm', res_mm(3));
 seq.setDefinition('ro_os', ro_os);
 seq.setDefinition('Nx_os', Nx_os);
 seq.setDefinition('OrientationMapping', slOrientation);
+seq.setDefinition('ReadoutAxis', ax.d1);
+seq.setDefinition('InnerPEAxis', ax.d2);
+seq.setDefinition('OuterPEAxis', ax.d3);
 seq.setDefinition('ReceiverGainHigh', 1);
 seq.setDefinition('ReadoutOversamplingFactor', ro_os);
 

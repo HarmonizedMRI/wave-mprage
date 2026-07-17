@@ -19,8 +19,10 @@ The MPRAGE sequence is built based on Maxim's Pulseq MPRAGE demo:
 │       ├── defineSineWaveGradient.m
 │       └── ...
 └── recon/
-    ├── recon_wave_mprage_from_twix.py
+    ├── recon_wave_mprage_from_twix_integrated_nifti.py
     └── utils/
+        ├── nifti_export_twix.py
+        └── ...
 ```
 
 The repository may also retain earlier standalone MPRAGE and FLASH calibration scripts for development or comparison. The recommended sequence generator is:
@@ -247,35 +249,177 @@ The integrated script expects the existing helper to be available under `seq/uti
 
 ## Reconstruction
 
-### `recon/recon_wave_mprage_from_twix.py`
+### Recommended integrated reconstruction script
 
-Python reconstruction script for Siemens TWIX data.
+The recommended reconstruction entry point for the integrated MPRAGE + FLASH calibration acquisition is:
 
-The reconstruction workflow includes:
+```text
+recon/recon_wave_mprage_from_twix_integrated_nifti.py
+```
 
-- loading Wave MPRAGE or no-wave MPRAGE data
-- loading FLASH wave-calibration data
-- estimating coil-compression weights from calibration data
-- estimating ESPIRiT coil sensitivity maps
-- generating a calibrated wave PSF from the FLASH calibration data
-- reconstructing wave data with wave CG-SENSE
-- reconstructing no-wave data with standard CG-SENSE
-- saving intermediate coil-compressed k-space, coil maps, PSF diagnostics, and reconstructed images as `.npy` and `.png` outputs
-
-For the integrated acquisition, the TWIX measurement contains:
+This script is designed for a single integrated Siemens TWIX measurement and its matching integrated Pulseq `.seq` file. The integrated measurement contains:
 
 ```text
 image   -> MPRAGE k-space
-refscan -> FLASH calibration k-space
+refscan -> FLASH calibration and ACS k-space
 ```
 
-The matching integrated `.seq` file contains the metadata for both acquisition parts.
+The reconstruction workflow includes:
 
-The current reconstruction output is saved as NumPy files. NIfTI export can be performed downstream when needed.
+- loading Wave MPRAGE or no-wave MPRAGE data from the `image` container
+- loading integrated FLASH calibration and ACS data from the `refscan` container
+- estimating coil-compression weights from the integrated ACS refscan set
+- estimating ESPIRiT coil sensitivity maps
+- generating a calibrated wave PSF from the integrated FLASH calibration refscan sets
+- reconstructing wave data with wave CG-SENSE
+- reconstructing no-wave data with standard CG-SENSE
+- saving intermediate coil-compressed k-space, coil maps, PSF diagnostics, and reconstructed images as `.npy` and `.png` outputs
+- optionally exporting the final image to NIfTI using the orientation stored in the input MPRAGE TWIX `.dat` file
 
-### `recon/utils/`
+The older `recon_wave_mprage_from_twix.py` script may be retained for compatibility or development history, but the integrated NIfTI-capable script should be used for the current integrated acquisition.
 
-Reconstruction helper functions include TWIX import, coil compression, coil-sensitivity plotting, PSF phase fitting, and wave CG-SENSE operations.
+### Integrated refscan layout used by reconstruction
+
+The integrated reconstruction assumes the following `refscan` `SET` layout:
+
+| SET | Purpose |
+|---:|---|
+| 0 | no-wave sine-projection calibration |
+| 1 | sine-wave projection calibration |
+| 2 | no-wave cosine-projection calibration |
+| 3 | cosine-wave projection calibration |
+| 4 / last | no-wave ACS block for coil compression and ESPIRiT |
+
+The default calibration sizes are:
+
+```text
+Ncalib = 72
+Nacs   = 32
+```
+
+Ncalib and Nacs are read from the Pulseq sequence definitions. The integrated sequence should save these values using seq.setDefinition, for example:
+  seq.setDefinition('Ncalib', Ncalib1);
+  seq.setDefinition('Nacs', Nacs);
+  
+If reconstruction raises an error that Ncalib or Nacs cannot be found, update the MATLAB sequence script to write these values into the .seq definitions, then regenerate the .seq file.
+
+### Hard-coded sagittal logical-axis convention
+
+The current integrated Wave-MPRAGE sequence is sagittal and uses this logical axis order during sequence generation:
+
+```matlab
+ax.d1 = 'z';  % readout
+ax.d2 = 'x';  % inner PE / PAR
+ax.d3 = 'y';  % outer PE / LIN
+```
+
+Because this `ax` structure is not saved in the `.seq` definitions, the reconstruction script hard-codes the corresponding remapping from physical sequence definitions to logical reconstruction dimensions:
+
+```text
+logical readout Nro = defs["Nz"]
+logical phase   Ny  = defs["Ny"]
+logical PAR     Nz  = defs["Nx"]
+```
+
+The FOV and voxel-size calculations are remapped in the same order:
+
+```text
+logical readout FOV = FOVz
+logical phase FOV   = FOVy
+logical PAR FOV     = FOVx
+```
+
+For example, if the sequence definitions contain:
+
+```text
+defs["Nx"] = 192
+defs["Ny"] = 256
+defs["Nz"] = 256
+ro_os      = 4
+```
+
+then reconstruction uses:
+
+```text
+Nro    = 256
+Ny     = 256
+Nz     = 192
+Nro_os = 1024
+```
+
+The reconstructed array is stored in logical order:
+
+```text
+axis 0 = readout, physical z
+axis 1 = LIN / phase, physical y
+axis 2 = PAR / partition, physical x
+```
+
+### NIfTI export
+
+The integrated reconstruction script can optionally export the final reconstructed image to NIfTI:
+
+```bash
+--save-nifti
+```
+
+Magnitude NIfTI export is enabled whenever `--save-nifti` is used. Phase export can also be enabled:
+
+```bash
+--save-nifti-phase
+```
+
+NIfTI orientation is derived from the input MPRAGE TWIX `.dat` file using MeasYaps geometry. The script uses the helper module:
+
+```text
+recon/utils/nifti_export_twix.py
+```
+
+NIfTI export center-crops readout oversampling before writing the NIfTI files. This crop is applied only to the NIfTI output; the `.npy` reconstruction output remains in the oversampled readout grid.
+
+Default NIfTI behavior:
+
+```text
+output folder:        <out_folder>/nifti/
+magnitude export:     enabled with --save-nifti
+phase export:         enabled with --save-nifti-phase
+axis roles:           readout,phase,slice
+axis flips:           false,true,false
+Twix coordinate mode: LPS
+in-plane rot sign:    -1.0
+```
+
+Useful NIfTI-related command-line options:
+
+```bash
+--save-nifti
+--save-nifti-phase
+--nifti-out-folder /path/to/nifti_output
+--nifti-sub sub-name-or-label
+--nifti-suffix MPRAGE
+--nifti-axis-roles readout,phase,slice
+--nifti-axis-flips false,true,false
+--twix-coord-system LPS
+--twix-inplane-rot-sign -1
+--twix-use-fov-for-voxel-size
+```
+
+If the exported image appears mirrored or rotated relative to a trusted DICOM/NIfTI reference, adjust the axis flips or in-plane rotation sign and re-export.
+
+### Reconstruction outputs
+
+The reconstruction script writes outputs to the selected output folder, including:
+
+- coil-compression matrix and energy files
+- coil sensitivity maps
+- coil sensitivity magnitude and phase plots
+- coil-compressed MPRAGE k-space
+- PSF calibration fits and diagnostic plots for wave reconstruction
+- reconstructed wave or no-wave image arrays as `.npy`
+- optional magnitude NIfTI and JSON sidecar files
+- optional phase NIfTI and JSON sidecar files
+
+Output filenames include the resolution, acceleration factors, reconstruction mode, and user-provided file tag when available.
 
 ## Prerequisites
 
@@ -309,7 +453,16 @@ Required:
 - an NVIDIA GPU visible to CuPy, SigPy, and PyTorch
 - the repository `recon/utils/` modules available on the Python path
 
-The reconstruction code uses the GPU for coil-compression-related processing and ESPIRiT calibration through CuPy and SigPy.
+Required for optional NIfTI export:
+
+- nibabel
+- mapvbvd, for reading Siemens TWIX MeasYaps geometry from the input `.dat` file
+
+Optional:
+
+- pydicom, if using DICOM-derived affine helper functions retained in `nifti_export_twix.py`
+
+The reconstruction code uses the GPU for coil-compression-related processing and ESPIRiT calibration through CuPy and SigPy. NIfTI export uses the input MPRAGE TWIX `.dat` file to derive orientation and writes `.nii.gz` plus JSON sidecar outputs.
 
 Before running the reconstruction, make sure the following components are mutually compatible:
 
@@ -359,11 +512,13 @@ Example:
 conda create -n wave-mprage-recon python=3.10
 conda activate wave-mprage-recon
 
-pip install numpy scipy matplotlib pypulseq sigpy torch
+pip install numpy scipy matplotlib pypulseq sigpy torch nibabel mapvbvd
 # Install the CuPy package matching the local CUDA environment:
 # pip install cupy-cuda11x
 # or
 # pip install cupy-cuda12x
+# Optional if using DICOM affine utilities:
+# pip install pydicom
 ```
 
 Verify the GPU stack:
@@ -421,17 +576,41 @@ The interactive JSON workflow is still used, allowing saved or workspace paths t
 
 ### Reconstruct Wave MPRAGE data
 
-Run the reconstruction script from the repository root or the `recon/` folder.
+Run the integrated reconstruction script from the repository root or the `recon/` folder.
 
-The integrated sequence produces one TWIX measurement with MPRAGE in `image` and FLASH calibration in `refscan`. Reconstruction code should read the two containers from the same measurement.
+The integrated sequence produces one TWIX measurement with MPRAGE in `image` and FLASH calibration/ACS data in `refscan`. Reconstruction reads both containers from the same measurement.
 
-The exact command-line arguments depend on the current version of `recon_wave_mprage_from_twix.py`. Use:
+Review command-line options with:
 
 ```bash
-python recon_wave_mprage_from_twix.py --help
+python recon_wave_mprage_from_twix_integrated_nifti.py --help
 ```
 
-to review its required file and reconstruction-mode arguments.
+Example wave reconstruction with NIfTI magnitude and phase export:
+
+```bash
+python recon_wave_mprage_from_twix_integrated_nifti.py \
+  --data-folder /path/to/data \
+  --out-folder /path/to/output \
+  --mprage-data-file meas_integrated_wave_mprage.dat \
+  --mprage-seq-file mprage_3d_flashcalib_wave.seq \
+  --tag-wave wave \
+  --file-tag test01 \
+  --save-nifti \
+  --save-nifti-phase
+```
+
+Example no-wave reconstruction without NIfTI export:
+
+```bash
+python recon_wave_mprage_from_twix_integrated_nifti.py \
+  --data-folder /path/to/data \
+  --out-folder /path/to/output \
+  --mprage-data-file meas_integrated_nowave_mprage.dat \
+  --mprage-seq-file mprage_3d_flashcalib_nowave.seq \
+  --tag-wave nowave \
+  --file-tag test01
+```
 
 ### Reconstruction inputs
 
@@ -445,15 +624,4 @@ For the integrated acquisition, the core inputs are:
 
 The MPRAGE and calibration portions automatically share geometry, FOV, matrix size, orientation, readout oversampling, readout duration, RF settings, wave amplitude, and number of wave cycles because they are generated by the same sequence script.
 
-### Reconstruction outputs
-
-The reconstruction script writes outputs to the selected output folder, including:
-
-- coil-compression matrix and energy files
-- coil sensitivity maps
-- coil sensitivity magnitude and phase plots
-- coil-compressed MPRAGE k-space
-- PSF calibration fits and diagnostic plots for wave reconstruction
-- reconstructed wave or no-wave image arrays
-
-Output filenames include the resolution, acceleration factors, reconstruction mode, and user-provided file tag when available.
+For NIfTI export, the same MPRAGE TWIX `.dat` file is also used as the orientation source.
