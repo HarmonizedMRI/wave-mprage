@@ -37,7 +37,13 @@ import os
 import argparse
 from pathlib import Path
 
-import cupy as cp
+try:
+    import cupy as cp
+except Exception as exc:
+    cp = None
+    _CUPY_IMPORT_ERROR = exc
+else:
+    _CUPY_IMPORT_ERROR = None
 import sigpy as sp
 import sigpy.mri as mr
 import gc
@@ -74,6 +80,8 @@ def main():
     file_tag = cfg["file_tag"]
     tag_wave = cfg["tag_wave"]
     reuse_coil_calib = cfg["reuse_coil_calib"]
+    espirit_device = cfg["espirit_device"]
+    espirit_gpu_index = cfg["espirit_gpu_index"]
     yflip = cfg["yflip"]
     zflip = cfg["zflip"]
     save_nifti = cfg["save_nifti"]
@@ -138,6 +146,8 @@ def main():
         file_tag=file_tag,
         Nacs=nacs,
         reuse_coil_calib=reuse_coil_calib,
+        espirit_device=espirit_device,
+        espirit_gpu_index=espirit_gpu_index,
     )
     if Ncoil_ref != Ncoil:
         raise ValueError(
@@ -507,7 +517,83 @@ def _sanitize_filename_component(value):
 # Integrated refscan ACS / coil-sensitivity handling
 # -----------------------------------------------------------------------------
 
-def load_or_generate_coil_sens(mprage_data_file, Ny, Nz, os_factor, out_folder, file_tag, Nacs=32, reuse_coil_calib=False):
+def _cuda_device_count():
+    """Return visible CUDA device count and an optional diagnostic message."""
+    if cp is None:
+        detail = "CuPy is not installed"
+        if _CUPY_IMPORT_ERROR is not None:
+            detail += f" ({type(_CUPY_IMPORT_ERROR).__name__}: {_CUPY_IMPORT_ERROR})"
+        return 0, detail
+
+    try:
+        return int(cp.cuda.runtime.getDeviceCount()), None
+    except Exception as exc:
+        return 0, f"CuPy/CUDA initialization failed ({type(exc).__name__}: {exc})"
+
+
+def _cuda_device_name(index):
+    """Return a readable CUDA device name."""
+    props = cp.cuda.runtime.getDeviceProperties(index)
+    name = props.get("name", f"GPU {index}")
+    return name.decode() if isinstance(name, bytes) else str(name)
+
+
+def _select_espirit_device(mode="auto", gpu_index=0):
+    """Select a SigPy device for ESPIRiT with an explicit CPU fallback."""
+    mode = str(mode).strip().lower()
+    if mode not in ("auto", "cpu", "gpu"):
+        raise ValueError("espirit_device must be 'auto', 'cpu', or 'gpu'.")
+
+    gpu_index = int(gpu_index)
+    if gpu_index < 0:
+        raise ValueError("espirit_gpu_index must be a non-negative integer.")
+
+    if mode == "cpu":
+        print("ESPIRiT calibration device: CPU (explicit request)")
+        return sp.Device(-1), False
+
+    count, diagnostic = _cuda_device_count()
+    if count > gpu_index:
+        print(f"CuPy version: {cp.__version__}")
+        print(f"Visible CUDA device count: {count}")
+        for index in range(count):
+            try:
+                print(f"  GPU {index}: {_cuda_device_name(index)}")
+            except Exception as exc:
+                print(f"  GPU {index}: unable to read device properties ({exc})")
+        print(f"ESPIRiT calibration device: GPU {gpu_index}")
+        return sp.Device(gpu_index), True
+
+    if count > 0:
+        diagnostic = (
+            f"requested GPU index {gpu_index}, but only {count} CUDA device(s) are visible"
+        )
+    elif diagnostic is None:
+        diagnostic = "no CUDA devices are visible"
+
+    if mode == "gpu":
+        raise RuntimeError(
+            "GPU ESPIRiT was requested, but no usable requested GPU was found: "
+            f"{diagnostic}. Use --espirit-device auto or cpu to allow CPU calibration."
+        )
+
+    print(f"ESPIRiT GPU unavailable: {diagnostic}.")
+    print("ESPIRiT calibration device: CPU fallback")
+    return sp.Device(-1), False
+
+
+def load_or_generate_coil_sens(
+    mprage_data_file,
+    Ny,
+    Nz,
+    os_factor,
+    out_folder,
+    file_tag,
+    Nacs=32,
+    reuse_coil_calib=False,
+    espirit_device="auto",
+    espirit_gpu_index=0,
+):
     """Load cached Wcc/CSM or generate them from the integrated ACS refscan set."""
     wcc_file = _npy_output_path(out_folder + 'coil_compression_energy_' + file_tag)
     csm_file = _npy_output_path(out_folder + 'csm_full_' + file_tag)
@@ -534,22 +620,27 @@ def load_or_generate_coil_sens(mprage_data_file, Ny, Nz, os_factor, out_folder, 
         out_folder=out_folder,
         file_tag=file_tag,
         Nacs=Nacs,
+        espirit_device=espirit_device,
+        espirit_gpu_index=espirit_gpu_index,
     )
 
 
-def generate_coil_sens(mprage_data_file, Ny, Nz, os_factor, out_folder, file_tag, Nacs=32):
+def generate_coil_sens(
+    mprage_data_file,
+    Ny,
+    Nz,
+    os_factor,
+    out_folder,
+    file_tag,
+    Nacs=32,
+    espirit_device="auto",
+    espirit_gpu_index=0,
+):
     """Generate Wcc and ESPIRiT CSMs from the integrated sequence ACS refscan."""
-    # assign sigpy operator to GPU
-    print("CuPy version:", cp.__version__)
-    print("GPU count:", cp.cuda.runtime.getDeviceCount())
-
-    for i in range(cp.cuda.runtime.getDeviceCount()):
-        props = cp.cuda.runtime.getDeviceProperties(i)
-        name = props["name"].decode() if isinstance(props["name"], bytes) else props["name"]
-        print(i, name)
-
-    device = sp.Device(0)   # first visible GPU
-    print(device)
+    device, using_gpu = _select_espirit_device(
+        mode=espirit_device,
+        gpu_index=espirit_gpu_index,
+    )
 
     # The integrated refscan layout uses the last set for ACS.
     data_ref = load_ref(mprage_data_file)
@@ -580,7 +671,7 @@ def generate_coil_sens(mprage_data_file, Ny, Nz, os_factor, out_folder, file_tag
         .astype(np.complex64, copy=False)
     )
 
-    # Low-res crop before GPU
+    # Low-resolution crop before ESPIRiT device transfer.
     low_shape = (kspace_nowave_np.shape[0], Nx, 32, 32)
     kspace_low_np = sp.resize(kspace_nowave_np, low_shape).astype(np.complex64, copy=False)
 
@@ -588,7 +679,8 @@ def generate_coil_sens(mprage_data_file, Ny, Nz, os_factor, out_folder, file_tag
     kspace_low_cc_np = apply_cc_coilfirst_np(kspace_low_np, Wcc)
     print("kspace_low_cc_np:", kspace_low_cc_np.shape)
 
-    cp.get_default_memory_pool().free_all_blocks()
+    if using_gpu:
+        cp.get_default_memory_pool().free_all_blocks()
     gc.collect()
 
     kspace_low_cc_sp = sp.to_device(kspace_low_cc_np, device)
@@ -913,6 +1005,18 @@ def _parse_cli_args():
                         help="Reconstruction type: 'wave' or 'nowave'.")
     parser.add_argument("--reuse-coil-calib", action="store_true",
                         help="Reuse existing coil_compression_energy_<tag>.npy and csm_full_<tag>.npy if present.")
+    parser.add_argument(
+        "--espirit-device",
+        choices=("auto", "cpu", "gpu"),
+        default=None,
+        help="ESPIRiT device: auto uses GPU when available and otherwise CPU. Default: auto.",
+    )
+    parser.add_argument(
+        "--espirit-gpu-index",
+        type=int,
+        default=None,
+        help="CUDA device index used when ESPIRiT selects a GPU. Default: 0.",
+    )
     parser.add_argument("--yflip", type=int, default=None,
                         help="Sign convention for y wave PSF calibration. Default: -1.")
     parser.add_argument("--zflip", type=int, default=None,
@@ -1067,6 +1171,19 @@ def _collect_runtime_config():
     print(f"Using tag_wave: {tag_wave_value}")
 
     reuse_coil_calib_value = bool(cli.reuse_coil_calib or globals().get("reuse_coil_calib", False))
+    espirit_device_value = cli.espirit_device
+    if espirit_device_value is None:
+        espirit_device_value = globals().get("espirit_device", "auto")
+    espirit_device_value = str(espirit_device_value).strip().lower()
+    if espirit_device_value not in ("auto", "cpu", "gpu"):
+        raise ValueError("espirit_device must be 'auto', 'cpu', or 'gpu'.")
+
+    if cli.espirit_gpu_index is not None:
+        espirit_gpu_index_value = int(cli.espirit_gpu_index)
+    else:
+        espirit_gpu_index_value = int(globals().get("espirit_gpu_index", 0))
+    if espirit_gpu_index_value < 0:
+        raise ValueError("espirit_gpu_index must be a non-negative integer.")
 
     yflip_value = _get_optional_int("yflip", cli.yflip, default=-1, allowed_values=(-1, 1))
     zflip_value = _get_optional_int("zflip", cli.zflip, default=-1, allowed_values=(-1, 1))
@@ -1130,6 +1247,9 @@ def _collect_runtime_config():
     print(f"  file_tag:          {file_tag_value}")
     print(f"  reconstruction:    {tag_wave_value}")
     print(f"  reuse_coil_calib:  {reuse_coil_calib_value}")
+    print("  coil compression: CPU")
+    print(f"  ESPIRiT request:  {espirit_device_value} (GPU index {espirit_gpu_index_value})")
+    print("  CG-SENSE:         CPU")
     print(f"  yflip/zflip:       {yflip_value}/{zflip_value}")
     print(f"  save_nifti:        {save_nifti_value}")
     if save_nifti_value:
@@ -1149,6 +1269,8 @@ def _collect_runtime_config():
         "file_tag": file_tag_value,
         "tag_wave": tag_wave_value,
         "reuse_coil_calib": reuse_coil_calib_value,
+        "espirit_device": espirit_device_value,
+        "espirit_gpu_index": espirit_gpu_index_value,
         "yflip": yflip_value,
         "zflip": zflip_value,
         "save_nifti": save_nifti_value,
