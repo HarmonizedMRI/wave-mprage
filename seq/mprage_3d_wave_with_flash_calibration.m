@@ -108,8 +108,6 @@ fprintf(['Requested resolution [x y z] = [%.4g %.4g %.4g] mm. ', ...
 gwave_max = 8;                    % mT/m
 swave_max = 200;                  % T/m/s
 Ncycles   = 10;
-tag_wave_details = ['_amp' num2str(gwave_max) ...
-    '_cycles' num2str(Ncycles) '_' slOrientation];
 
 %% FLASH calibration-only parameters
 Ndummy = 300;
@@ -169,7 +167,7 @@ sys_type_options          = {'prisma', 'skyra', 'Connectome2', 'C2_simulate_pris
 sys_type                  = selectStringOption('sys_type', 'Select scanner/system name', sys_type_options, 'prisma');
 slew_safety_magrin        = 0.7;
 grad_safety_magrin        = 0.9;
-lowPNS_slew_safety_margin = 0.4;
+lowPNS_slew_safety_margin = 0.35;
 lowPNS_grad_safety_margin = grad_safety_magrin;
 diff_slew_safety_margin   = 0.45; % decrease this to reduce PNS, this would not lengthen TE too much
 diff_grad_safety_margin   = 0.97;
@@ -959,48 +957,86 @@ for p = 1:numel(calParts)
     seq.setDefinition([prefix 'KzPhysStop0'], calParts(p).kzList(end)-1);
 end
 
-if isUseWave_sin || isUseWave_cos
-    tag_wave = '_wave';
-    if isUseWave_sin, tag_wave = [tag_wave '_sin']; end
-    if isUseWave_cos, tag_wave = [tag_wave '_cos']; end
-else
-    tag_wave = '_nowave';
-end
+%% Compact sequence filename
+% Keep every generated filename below the scanner interpreter's
+% 128-character limit, including the ".seq" extension.
+%
+% Example:
+% mprage_3d_wave_FOV192x256x256_res1x1x1_ETL192_R1-2_R2-3_...
+% os4_amp8_cyc10_SAG_prisma_v151.seq
 
-tag_res = ['_res', strrep(num2str(res_mm(1), '%.3g'), '.', 'p'), 'x', ...
-    strrep(num2str(res_mm(2), '%.3g'), '.', 'p'), 'x', ...
-    strrep(num2str(res_mm(3), '%.3g'), '.', 'p'), 'mm'];
-tag_etl = ['_ETL' num2str(ETLtarget) '_' etlPlan_img.mode];
-seqFilename = ['mprage_3d_flashcalib', tag_wave, '_', ...
-    num2str(N(1)), 'x', num2str(N(2)), 'x', num2str(N(3)), ...
-    tag_res, tag_etl, '_R1_', num2str(R1), '_R2_', num2str(R2), ...
-    '_cal', num2str(Ncalib1), 'x', num2str(Ncalib2), ...
-    '_acs', num2str(Nacs), '_os', num2str(ro_os), ...
-    tag_wave_details, '_', sys_type];
-seq.setDefinition('Name', seqFilename);
+compactNum = @(x) strrep( ...
+    strrep(sprintf('%.4g', x), '.', 'p'), ...
+    '-', 'm');
+
+fov_mm = fov(:).' * 1e3;
+
+fovTokens = arrayfun(compactNum, fov_mm, ...
+    'UniformOutput', false);
+resTokens = arrayfun(compactNum, res_mm, ...
+    'UniformOutput', false);
+
+fovString = strjoin(fovTokens, 'x');
+resString = strjoin(resTokens, 'x');
+
+seqBaseName = sprintf( ...
+    ['mprage_3d_wave_FOV%s_res%s_ETL%d_' ...
+     'R1-%d_R2-%d_os%d_amp%s_cyc%d_%s_%s'], ...
+    fovString, ...
+    resString, ...
+    ETLtarget, ...
+    R1, ...
+    R2, ...
+    ro_os, ...
+    compactNum(gwave_max), ...
+    Ncycles, ...
+    slOrientation, ...
+    sys_type);
+
+% Store the compact format-independent name in the sequence definition.
+seq.setDefinition('Name', seqBaseName);
 
 %% Write sequence
-% Save the sequence before optional PNS/CNS and forbidden-frequency checks.
-% If no output path was entered during path setup, out_path is MATLAB's
-% current folder at setup time. Generated sequence folders are git-ignored.
+% Save before optional PNS/CNS and forbidden-frequency checks.
 outDir_v141 = fullfile(out_path, 'generated_seq_v141');
 outDir_v151 = fullfile(out_path, 'generated_seq_v151');
-if write_v141_format && ~exist(outDir_v141, 'dir'), mkdir(outDir_v141); end
-if ~exist(outDir_v151, 'dir'), mkdir(outDir_v151); end
+
+if write_v141_format && ~exist(outDir_v141, 'dir')
+    mkdir(outDir_v141);
+end
+
+if ~exist(outDir_v151, 'dir')
+    mkdir(outDir_v151);
+end
+
+fileName_v141 = [seqBaseName '_v141.seq'];
+fileName_v151 = [seqBaseName '_v151.seq'];
+
+% The scanner limit is strictly less than 128 characters.
+assert(numel(fileName_v141) < 128, ...
+    ['The v141 sequence filename contains %d characters. ' ...
+     'It must contain fewer than 128 characters:\n%s'], ...
+    numel(fileName_v141), fileName_v141);
+
+assert(numel(fileName_v151) < 128, ...
+    ['The v151 sequence filename contains %d characters. ' ...
+     'It must contain fewer than 128 characters:\n%s'], ...
+    numel(fileName_v151), fileName_v151);
 
 if write_v141_format
-    seqFile_v141 = fullfile(outDir_v141, [seqFilename '_v141.seq']);
-    seq.write_v141(seqFile_v141);    % Write to pulseq file (legacy v1.4.1 format)
-    fprintf('Write to file (v141): %s\n', seqFile_v141);
+    seqFile_v141 = fullfile(outDir_v141, fileName_v141);
+    seq.write_v141(seqFile_v141);
 
-    seqFile_v151 = fullfile(outDir_v151, [seqFilename '.seq']);
-    seq.write(seqFile_v151);         % Also write current format
-    fprintf('Write to file (v151): %s\n', seqFile_v151);
-else
-    seqFile_v151 = fullfile(outDir_v151, [seqFilename '.seq']);
-    seq.write(seqFile_v151);         % Write to pulseq file (current format)
-    fprintf('Write to file (v151 only): %s\n', seqFile_v151);
+    fprintf('Write to file (v141, %d characters):\n%s\n', ...
+        numel(fileName_v141), seqFile_v141);
 end
+
+seqFile_v151 = fullfile(outDir_v151, fileName_v151);
+seq.write(seqFile_v151);
+
+fprintf('Write to file (v151, %d characters):\n%s\n', ...
+    numel(fileName_v151), seqFile_v151);
+
 
 %% PNS/CNS check
 % mr:restoreShape warnings are off during this optional check by default
