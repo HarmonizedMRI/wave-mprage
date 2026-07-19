@@ -1,5 +1,65 @@
 # Troubleshooting
 
+## Required argument is missing
+
+The reconstruction now uses a strict direct-path command-line interface. The following arguments are required:
+
+```text
+--twix
+--seq
+--out
+```
+
+For example:
+
+```bash
+uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
+  --twix /path/to/data/scan.dat \
+  --seq /path/to/data/scan.seq \
+  --out /path/to/output \
+  --wave-mode auto
+```
+
+The old `--data-folder` argument is not needed. Pass a complete relative or absolute path to `--twix` and `--seq`.
+
+## An older argument name is used
+
+The following compatibility aliases remain valid:
+
+```text
+--mprage-data-file  -> --twix
+--mprage-seq-file   -> --seq
+--out-folder        -> --out
+--mode              -> --wave-mode
+--tag-wave          -> --wave-mode
+```
+
+Prefer the concise names in new scripts and documentation.
+
+## Wave-mode auto-detection disagrees with the requested mode
+
+When `--wave-mode wave` or `--wave-mode nowave` is supplied, the script compares the request with the MPRAGE imaging trajectory. The integrated FLASH calibration and ACS tail is excluded from this detection.
+
+A mismatch usually means one of the following:
+
+- the `.seq` file does not match the TWIX measurement
+- `wave` was requested for a no-wave sequence
+- `nowave` was requested for a wave sequence
+- the sequence trajectory is malformed or uses an unsupported configuration
+
+Use the matching `.seq` file or use `--wave-mode auto` to let the script select the mode.
+
+## One-axis Wave-MPRAGE is rejected
+
+The current reconstruction supports only:
+
+```text
+both sine and cosine wave axes active -> wave
+both sine and cosine wave axes inactive -> nowave
+```
+
+Sine-only and cosine-only MPRAGE imaging trajectories are rejected because the reconstruction does not provide a validated one-axis wave path. Regenerate the sequence with both wave axes enabled or both disabled.
+
 ## `pip install --group` is not recognized
 
 Dependency groups require pip 25.1 or newer:
@@ -34,7 +94,9 @@ or:
 
 Do not install the `gpu` dependency group unless the machine has a compatible NVIDIA driver and CUDA 12 environment.
 
-## Automatic mode falls back to CPU
+## ESPIRiT automatic device selection falls back to CPU
+
+This section refers to `--espirit-device auto`, not `--wave-mode auto`.
 
 The script prints the reason. Common causes are:
 

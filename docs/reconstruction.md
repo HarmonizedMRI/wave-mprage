@@ -14,12 +14,23 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py --help
 
 ## Inputs
 
-The current script expects:
+The script requires:
 
 - one integrated Siemens TWIX `.dat` file
 - the matching integrated Pulseq `.seq` file
-- output folder
-- reconstruction mode: `wave` or `nowave`
+- an output directory
+- a wave-mode selection: `auto`, `wave`, or `nowave`
+
+The preferred command-line arguments are:
+
+```text
+--twix PATH       integrated Wave-MPRAGE + calibration TWIX .dat file
+--seq PATH        matching integrated Wave-MPRAGE + calibration .seq file
+--out PATH        reconstruction output directory
+--wave-mode MODE  auto, wave, or nowave; default auto
+```
+
+The paths passed to `--twix` and `--seq` may be absolute or relative to the current working directory. A separate shared data-folder argument is not required.
 
 The TWIX containers are expected to be:
 
@@ -40,18 +51,62 @@ The integrated refscan SET convention is:
 
 Calibration dimensions are read from `Calibration_Ncalib1` and `Calibration_Nacs` in the sequence definitions, with defaults of 72 and 32.
 
+## Wave-mode selection
+
+`--wave-mode` accepts:
+
+```text
+auto    inspect the MPRAGE imaging trajectory and select wave or nowave
+wave    require a two-axis wave imaging trajectory
+nowave  require a no-wave imaging trajectory
+```
+
+`auto` is the default. The mode detector excludes the appended integrated FLASH calibration and ACS trajectory before inspecting the MPRAGE imaging trajectory.
+
+The supported imaging configurations are:
+
+| Detected imaging trajectory | Result |
+|---|---|
+| sine and cosine wave axes both active | `wave` |
+| sine and cosine wave axes both inactive | `nowave` |
+| sine only | rejected |
+| cosine only | rejected |
+
+When the user explicitly selects `wave` or `nowave`, the script verifies that the requested mode agrees with the detected trajectory. A mismatch raises an error rather than running the wrong forward model.
+
+## Compatibility aliases
+
+The concise direct-path arguments are preferred, but the earlier MPRAGE-specific names remain accepted:
+
+| Preferred argument | Compatibility aliases | Parsed destination |
+|---|---|---|
+| `--twix` | `--mprage-data-file` | `twix` |
+| `--seq` | `--mprage-seq-file` | `seq` |
+| `--out` | `--out-folder` | `out` |
+| `--wave-mode` | `--mode`, `--tag-wave` | `mode` |
+
+For example, these are equivalent:
+
+```bash
+--wave-mode auto
+--mode auto
+```
+
+The old `--data-folder` argument is not part of the direct-path interface. Supply the complete relative or absolute path to each input instead.
+
 ## Pipeline
 
 1. Read geometry and acceleration definitions from the `.seq` file.
-2. Load MPRAGE k-space from the TWIX `image` container.
-3. Load the integrated ACS block from the final `refscan` SET.
-4. Estimate a 32-to-12 coil-compression matrix on CPU.
-5. Apply coil compression on CPU.
-6. Estimate low-resolution ESPIRiT maps on the selected SigPy device.
-7. Interpolate and normalize the sensitivity maps.
-8. For wave data, fit the FLASH projection phase deviation and construct the calibrated wave PSF.
-9. Run wave or no-wave CG-SENSE on CPU.
-10. Save `.npy` arrays, diagnostic plots, and optional NIfTI outputs.
+2. Inspect the MPRAGE imaging trajectory and resolve the requested wave mode.
+3. Load MPRAGE k-space from the TWIX `image` container.
+4. Load the integrated ACS block from the final `refscan` SET.
+5. Estimate a 32-to-12 coil-compression matrix on CPU.
+6. Apply coil compression on CPU.
+7. Estimate low-resolution ESPIRiT maps on the selected SigPy device.
+8. Interpolate and normalize the sensitivity maps.
+9. For wave data, fit the FLASH projection phase deviation and construct the calibrated wave PSF.
+10. Run wave or no-wave CG-SENSE on CPU.
+11. Save `.npy` arrays, diagnostic plots, and optional NIfTI outputs.
 
 ## CPU and GPU behavior
 
@@ -64,7 +119,7 @@ The current implementation does not move the full reconstruction to GPU.
 | ESPIRiT calibration | selectable SigPy CPU or GPU |
 | Wave and no-wave CG-SENSE | CPU / PyTorch tensor |
 
-### ESPIRiT selection
+### ESPIRiT device selection
 
 ```text
 --espirit-device auto   default; use a visible compatible GPU, otherwise CPU
@@ -73,48 +128,71 @@ The current implementation does not move the full reconstruction to GPU.
 --espirit-gpu-index N   select GPU index, default 0
 ```
 
-`auto` catches missing CuPy, CUDA initialization failures, and an unavailable requested GPU index, then reports the reason and uses CPU. Explicit `gpu` mode raises an error for those conditions.
+This `auto` setting is independent of `--wave-mode auto`:
+
+- `--wave-mode auto` selects the reconstruction forward model from the sequence trajectory.
+- `--espirit-device auto` selects CPU or GPU for ESPIRiT calibration.
+
+ESPIRiT device auto-selection catches missing CuPy, CUDA initialization failures, and an unavailable requested GPU index, then reports the reason and uses CPU. Explicit `gpu` mode raises an error for those conditions.
 
 CuPy is therefore optional for CPU reconstruction. Install the `gpu` dependency group only on a CUDA 12 system where GPU-assisted ESPIRiT is desired.
 
 ## Examples
 
-### Wave reconstruction, automatic device
+### Automatic wave-mode and ESPIRiT device selection
 
 ```bash
 uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
-  --data-folder /path/to/data \
-  --out-folder /path/to/output \
-  --mprage-data-file meas_integrated_wave_mprage.dat \
-  --mprage-seq-file mprage_3d_flashcalib_wave.seq \
-  --tag-wave wave \
+  --twix /path/to/data/meas_integrated_wave_mprage.dat \
+  --seq /path/to/data/mprage_3d_flashcalib_wave.seq \
+  --out /path/to/output \
+  --wave-mode auto \
   --file-tag test01 \
   --espirit-device auto
 ```
 
-### CPU-only reconstruction
+### Explicit wave reconstruction on CPU
 
 ```bash
 uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
-  --data-folder /path/to/data \
-  --out-folder /path/to/output \
-  --mprage-data-file meas_integrated_wave_mprage.dat \
-  --mprage-seq-file mprage_3d_flashcalib_wave.seq \
-  --tag-wave wave \
+  --twix /path/to/data/meas_integrated_wave_mprage.dat \
+  --seq /path/to/data/mprage_3d_flashcalib_wave.seq \
+  --out /path/to/output \
+  --wave-mode wave \
   --espirit-device cpu
+```
+
+### Explicit no-wave reconstruction
+
+```bash
+uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
+  --twix /path/to/data/meas_integrated_nowave_mprage.dat \
+  --seq /path/to/data/mprage_3d_flashcalib_nowave.seq \
+  --out /path/to/output \
+  --wave-mode nowave \
+  --espirit-device auto
 ```
 
 ### Require GPU 1
 
 ```bash
 uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
-  --data-folder /path/to/data \
-  --out-folder /path/to/output \
-  --mprage-data-file meas_integrated_wave_mprage.dat \
-  --mprage-seq-file mprage_3d_flashcalib_wave.seq \
-  --tag-wave wave \
+  --twix /path/to/data/meas_integrated_wave_mprage.dat \
+  --seq /path/to/data/mprage_3d_flashcalib_wave.seq \
+  --out /path/to/output \
+  --wave-mode auto \
   --espirit-device gpu \
   --espirit-gpu-index 1
+```
+
+### Compatibility aliases
+
+```bash
+uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
+  --mprage-data-file /path/to/data/meas_integrated_wave_mprage.dat \
+  --mprage-seq-file /path/to/data/mprage_3d_flashcalib_wave.seq \
+  --out-folder /path/to/output \
+  --tag-wave wave
 ```
 
 ### Reuse cached coil calibration
@@ -164,7 +242,7 @@ The helper reads orientation from the MPRAGE TWIX MeasYaps geometry, center-crop
 Important defaults:
 
 ```text
-output folder:        <out_folder>/nifti/
+output folder:        <out>/nifti/
 axis roles:           readout,phase,slice
 axis flips:           false,true,false
 Twix coordinate mode: LPS

@@ -147,36 +147,56 @@ Review all arguments:
 uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py --help
 ```
 
-Example Wave-MPRAGE reconstruction with automatic ESPIRiT device selection and NIfTI export:
+The preferred input interface uses direct paths:
+
+```text
+--twix       integrated Siemens TWIX .dat file
+--seq        matching integrated Pulseq .seq file
+--out        reconstruction output directory
+--wave-mode  auto, wave, or nowave; default auto
+```
+
+`--wave-mode auto` inspects the MPRAGE imaging trajectory after excluding the appended FLASH calibration and ACS trajectory. It selects `wave` when both wave axes are active and `nowave` when both are inactive. One-axis wave acquisitions are rejected.
+
+Example reconstruction with automatic wave-mode detection, automatic ESPIRiT device selection, and NIfTI export:
 
 ```bash
 uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
-  --data-folder /path/to/data \
-  --out-folder /path/to/output \
-  --mprage-data-file meas_integrated_wave_mprage.dat \
-  --mprage-seq-file mprage_3d_flashcalib_wave.seq \
-  --tag-wave wave \
+  --twix /path/to/data/meas_integrated_wave_mprage.dat \
+  --seq /path/to/data/mprage_3d_flashcalib_wave.seq \
+  --out /path/to/output \
+  --wave-mode auto \
   --file-tag test01 \
   --espirit-device auto \
   --save-nifti \
   --save-nifti-phase
 ```
 
-Force CPU ESPIRiT on a machine without a usable CUDA stack:
+Force CPU ESPIRiT while explicitly requiring wave reconstruction:
 
 ```bash
 uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
-  --data-folder /path/to/data \
-  --out-folder /path/to/output \
-  --mprage-data-file meas_integrated_wave_mprage.dat \
-  --mprage-seq-file mprage_3d_flashcalib_wave.seq \
-  --tag-wave wave \
+  --twix /path/to/data/meas_integrated_wave_mprage.dat \
+  --seq /path/to/data/mprage_3d_flashcalib_wave.seq \
+  --out /path/to/output \
+  --wave-mode wave \
   --espirit-device cpu
 ```
 
 Use `--espirit-device gpu --espirit-gpu-index 0` to require a specific GPU. The script raises a clear error instead of silently falling back when GPU mode is explicitly requested.
 
-See [Reconstruction](docs/reconstruction.md) for the pipeline, input assumptions, complete device behavior, output files, and NIfTI conventions.
+The following compatibility aliases remain accepted:
+
+| Preferred argument | Compatibility aliases |
+|---|---|
+| `--twix` | `--mprage-data-file` |
+| `--seq` | `--mprage-seq-file` |
+| `--out` | `--out-folder` |
+| `--wave-mode` | `--mode`, `--tag-wave` |
+
+The old shared `--data-folder` argument is no longer needed because `--twix` and `--seq` accept direct absolute or relative paths.
+
+See [Reconstruction](docs/reconstruction.md) for the pipeline, input assumptions, complete command-line interface, device behavior, output files, and NIfTI conventions.
 
 ## Documentation
 
