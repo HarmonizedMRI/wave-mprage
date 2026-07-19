@@ -781,6 +781,75 @@ def generate_theoretical_wave_trajectory(fn_seq, Nx_os, Nacs_total, slice_orient
     return delta_ky_idx, delta_kz_idx
 
 
+def _resolve_mprage_wave_mode(
+    requested_mode,
+    mprage_seq_file,
+    Nx_os,
+    Ncalib,
+    Nacs,
+    slice_orientation="SAG",
+    activity_threshold=1e-4,
+):
+    """Resolve auto/wave/nowave from the MPRAGE imaging trajectory.
+
+    The integrated FLASH calibration and ACS tail is excluded by
+    generate_theoretical_wave_trajectory(), so only the MPRAGE imaging
+    trajectory is inspected.
+    """
+    requested_mode = str(requested_mode).strip().lower()
+    if requested_mode not in ("auto", "wave", "nowave"):
+        raise ValueError(
+            "wave mode must be 'auto', 'wave', or 'nowave'."
+        )
+
+    delta_ky_idx, delta_kz_idx = generate_theoretical_wave_trajectory(
+        fn_seq=mprage_seq_file,
+        Nx_os=Nx_os,
+        Nacs_total=int(Nx_os * (4 * Ncalib + Nacs * Nacs)),
+        slice_orientation=slice_orientation,
+    )
+
+    def waveform_excursion(values):
+        values = np.asarray(values, dtype=np.float64)
+        values = values - np.mean(values)
+        return float(np.max(np.abs(values)))
+
+    y_excursion = waveform_excursion(delta_ky_idx)
+    z_excursion = waveform_excursion(delta_kz_idx)
+
+    y_active = y_excursion > activity_threshold
+    z_active = z_excursion > activity_threshold
+
+    print(
+        "MPRAGE wave detection: "
+        f"ky excursion={y_excursion:.6g}, "
+        f"kz excursion={z_excursion:.6g}"
+    )
+
+    if y_active != z_active:
+        active_axis = "sine/LIN only" if y_active else "cosine/PAR only"
+        raise ValueError(
+            "One-axis Wave-MPRAGE is not supported by this reconstruction. "
+            f"Trajectory inspection detected {active_axis}. "
+            "Use both wave axes or disable both."
+        )
+
+    detected_mode = "wave" if y_active and z_active else "nowave"
+
+    if requested_mode == "auto":
+        print(f"Detected MPRAGE wave mode: {detected_mode}")
+        return detected_mode
+
+    if requested_mode != detected_mode:
+        raise ValueError(
+            f"Requested --wave-mode/--mode={requested_mode!r}, but "
+            f"trajectory inspection detected {detected_mode!r}."
+        )
+
+    print(f"Verified MPRAGE wave mode: {requested_mode}")
+    return requested_mode
+
+
 def fit_wave_psf_deviation_from_projection(mprage_data_file, mprage_seq_file, out_folder, file_tag,
                                            yflip=1, zflip=1, Ncalib=72, Nacs=32,
                                            slice_orientation='SAG'):
@@ -994,15 +1063,50 @@ def _parse_cli_args():
     parser = argparse.ArgumentParser(
         description="Reconstruct Wave-MPRAGE/no-wave MPRAGE data from an integrated Siemens TWIX file."
     )
-    parser.add_argument("--data-folder", default=None, help="Folder containing input .dat/.seq files.")
-    parser.add_argument("--out-folder", default=None, help="Folder where output .npy/.png files are saved.")
-    parser.add_argument("--mprage-data-file", default=None, help="Integrated Wave-MPRAGE + calibration TWIX .dat file.")
-    parser.add_argument("--mprage-seq-file", default=None, help="Integrated Wave-MPRAGE + calibration Pulseq .seq file.")
-    parser.add_argument("--calib-data-file", default=None, help="Deprecated compatibility alias. Integrated mode uses --mprage-data-file.")
-    parser.add_argument("--calib-seq-file", default=None, help="Deprecated compatibility alias. Integrated mode uses --mprage-seq-file.")
-    parser.add_argument("--file-tag", default=None, help="Suffix tag used in output filenames.")
-    parser.add_argument("--tag-wave", choices=("wave", "nowave"), default=None,
-                        help="Reconstruction type: 'wave' or 'nowave'.")
+        # Canonical direct-path interface, aligned with the GRE reconstruction.
+    #
+    # The older MPRAGE-specific argument names remain accepted as aliases,
+    # but --twix, --seq, --out, and --wave-mode are the preferred names.
+    parser.add_argument(
+        "--twix",
+        "--mprage-data-file",
+        dest="twix",
+        required=True,
+        help="Integrated Wave-MPRAGE + calibration Siemens TWIX .dat file.",
+    )
+    parser.add_argument(
+        "--seq",
+        "--mprage-seq-file",
+        dest="seq",
+        required=True,
+        help="Matching integrated Wave-MPRAGE + calibration Pulseq .seq file.",
+    )
+    parser.add_argument(
+        "--out",
+        "--out-folder",
+        dest="out",
+        required=True,
+        help="Output directory for reconstruction and calibration files.",
+    )
+    parser.add_argument(
+        "--wave-mode",
+        "--mode",
+        "--tag-wave",
+        dest="mode",
+        choices=("auto", "wave", "nowave"),
+        default="auto",
+        help=(
+            "Reconstruction mode. 'auto' determines wave versus no-wave "
+            "from the MPRAGE imaging trajectory. --mode and --tag-wave "
+            "are compatibility aliases."
+        ),
+    )
+
+    parser.add_argument(
+        "--file-tag",
+        default=None,
+        help="Suffix tag used in output filenames.",
+    )
     parser.add_argument("--reuse-coil-calib", action="store_true",
                         help="Reuse existing coil_compression_energy_<tag>.npy and csm_full_<tag>.npy if present.")
     parser.add_argument(
@@ -1041,8 +1145,7 @@ def _parse_cli_args():
                         help="Sign applied to Twix in-plane rotation. Default: -1.0.")
     parser.add_argument("--twix-use-fov-for-voxel-size", action="store_true",
                         help="Infer NIfTI voxel sizes from Twix FOV instead of reconstruction voxel size.")
-    args, _ = parser.parse_known_args()
-    return args
+    return parser.parse_args()
 
 
 def _prompt_for_value(name, prompt_text, default=None, required=True):
@@ -1118,57 +1221,56 @@ def _collect_runtime_config():
     """Collect runtime paths/tags from CLI args, existing globals, or prompts."""
     cli = _parse_cli_args()
 
-    data_folder_value = _prompt_for_value(
-        "data_folder",
-        "Folder containing the integrated TWIX .dat and Pulseq .seq files",
-        default=cli.data_folder,
+        # Direct input paths: no shared --data-folder is required.
+    mprage_data_value = _resolve_input_path(
+        cli.twix,
+        data_folder=None,
+        label="integrated MPRAGE data file",
     )
-    data_folder_value = os.path.abspath(os.path.expanduser(os.path.expandvars(str(data_folder_value))))
-
-    out_folder_value = _prompt_for_value(
-        "out_folder",
-        "Folder for output .npy/.png files",
-        default=cli.out_folder,
+    mprage_seq_value = _resolve_input_path(
+        cli.seq,
+        data_folder=None,
+        label="integrated MPRAGE sequence file",
     )
-    out_folder_value = _normalize_folder(out_folder_value)
+    out_folder_value = _normalize_folder(cli.out)
 
-    mprage_data_default = cli.mprage_data_file
-    if mprage_data_default is None and cli.calib_data_file is not None:
-        mprage_data_default = cli.calib_data_file
-    mprage_data_value = _prompt_for_value(
-        "mprage_data_file",
-        "Integrated Wave-MPRAGE + calibration TWIX .dat file",
-        default=mprage_data_default,
+    # Retain this internal value because the existing return dictionary and
+    # main() still contain a data_folder entry. It is not used to resolve the
+    # input files anymore.
+    data_folder_value = os.path.dirname(mprage_data_value)
+
+    file_tag_value = "" if cli.file_tag is None else str(cli.file_tag)
+
+    # Read enough sequence information to distinguish wave from no-wave while
+    # excluding the appended integrated calibration/ACS trajectory.
+    mode_seq = pp.Sequence()
+    mode_seq.read(mprage_seq_value, remove_duplicates=False)
+    mode_defs = mode_seq.definitions
+
+    mode_geom = _derive_hardcoded_sag_logical_geometry(mode_defs)
+    mode_os_factor = int(
+        mode_defs.get("ReadoutOversamplingFactor", 4)
+    )
+    mode_Nx_os = int(mode_geom["Nro"] * mode_os_factor)
+    mode_ncalib = int(
+        mode_defs.get("Calibration_Ncalib1", 72)
+    )
+    mode_nacs = int(
+        mode_defs.get("Calibration_Nacs", 32)
+    )
+    mode_orientation = mode_defs.get(
+        "OrientationMapping",
+        "SAG",
     )
 
-    mprage_seq_default = cli.mprage_seq_file
-    if mprage_seq_default is None and cli.calib_seq_file is not None:
-        mprage_seq_default = cli.calib_seq_file
-    mprage_seq_value = _prompt_for_value(
-        "mprage_seq_file",
-        "Integrated Wave-MPRAGE + calibration Pulseq .seq file",
-        default=mprage_seq_default,
+    tag_wave_value = _resolve_mprage_wave_mode(
+        requested_mode=cli.mode,
+        mprage_seq_file=mprage_seq_value,
+        Nx_os=mode_Nx_os,
+        Ncalib=mode_ncalib,
+        Nacs=mode_nacs,
+        slice_orientation=mode_orientation,
     )
-
-    file_tag_value = _prompt_for_value(
-        "file_tag",
-        "Output filename suffix/file tag",
-        default=cli.file_tag,
-        required=False,
-    )
-    file_tag_value = "" if file_tag_value is None else str(file_tag_value)
-
-    tag_default = cli.tag_wave
-    if tag_default is None and "tag_wave" in globals() and globals()["tag_wave"] not in (None, ""):
-        tag_default = globals()["tag_wave"]
-    if tag_default is None:
-        tag_default = _prompt_for_value(
-            "tag_wave",
-            "Reconstruct wave data? Enter yes/wave or no/nowave",
-            default=None,
-        )
-    tag_wave_value = _parse_wave_tag(tag_default)
-    print(f"Using tag_wave: {tag_wave_value}")
 
     reuse_coil_calib_value = bool(cli.reuse_coil_calib or globals().get("reuse_coil_calib", False))
     espirit_device_value = cli.espirit_device
@@ -1242,8 +1344,9 @@ def _collect_runtime_config():
     mprage_seq_value = _resolve_input_path(mprage_seq_value, data_folder_value, "integrated MPRAGE sequence file")
 
     print("Runtime configuration summary:")
-    print(f"  data_folder:       {data_folder_value}")
-    print(f"  out_folder:        {out_folder_value}")
+    print(f"  twix: {mprage_data_value}")
+    print(f"  seq: {mprage_seq_value}")
+    print(f"  out: {out_folder_value}")
     print(f"  file_tag:          {file_tag_value}")
     print(f"  reconstruction:    {tag_wave_value}")
     print(f"  reuse_coil_calib:  {reuse_coil_calib_value}")
