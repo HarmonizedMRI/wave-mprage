@@ -356,8 +356,8 @@ def save_mprage_output_to_nifti(
     voxel_size_mm=(1.0, 1.0, 1.0),
     crop_readout_os=1,
     save_phase=False,
-    twix_array_axis_roles=("readout", "phase", "slice"),
-    twix_array_axis_flips=(False, True, False),
+    twix_array_axis_roles=("phase", "readout", "slice"),
+    twix_array_axis_flips=(True, False, False),
     twix_coord_system="LPS",
     twix_inplane_rot_sign=-1.0,
     twix_use_fov_for_voxel_size=False,
@@ -1135,8 +1135,18 @@ def _parse_cli_args():
                         help="Subject/folder name for NIfTI outputs. Default is generated from recon settings.")
     parser.add_argument("--nifti-suffix", default=None,
                         help="NIfTI filename suffix. Default: MPRAGE.")
-    parser.add_argument("--nifti-axis-roles", default=None,
-                        help="Comma-separated Twix roles for output axes. Default: readout,phase,slice.")
+    parser.add_argument(
+        "--nifti-axis-roles",
+        nargs=3,
+        default=("phase", "readout", "slice"),
+        metavar=("AXIS0", "AXIS1", "AXIS2"),
+        help=(
+            "Twix physical roles of the reconstructed MPRAGE array axes. "
+            "The sagittal MPRAGE reconstruction is ordered as "
+            "(physical z, physical y, physical x), corresponding to "
+            "(phase, readout, slice) in the Twix geometry."
+        ),
+    )
     parser.add_argument("--nifti-axis-flips", default=None,
                         help="Comma-separated booleans for physical array flips before NIfTI. Default: false,true,false.")
     parser.add_argument("--twix-coord-system", default=None, choices=("LPS", "RAS"),
@@ -1319,7 +1329,7 @@ def _collect_runtime_config():
     axis_flips_source = cli.nifti_axis_flips
     if axis_flips_source is None and "nifti_axis_flips" in globals() and globals()["nifti_axis_flips"] not in (None, ""):
         axis_flips_source = globals()["nifti_axis_flips"]
-    nifti_axis_flips_value = _parse_bool_tuple(axis_flips_source, default=(False, True, False))
+    nifti_axis_flips_value = _parse_bool_tuple(axis_flips_source, default=(True, False, False))
 
     twix_coord_system_value = cli.twix_coord_system
     if twix_coord_system_value is None and "twix_coord_system" in globals() and globals()["twix_coord_system"] not in (None, ""):
@@ -1494,7 +1504,7 @@ def _parse_axis_roles(value, default=("readout", "phase", "slice")):
     return roles
 
 
-def _parse_bool_tuple(value, default=(False, True, False)):
+def _parse_bool_tuple(value, default=(True, False, False)):
     """Parse comma-separated booleans such as 'false,true,false'."""
     if value is None:
         return tuple(bool(x) for x in default)
