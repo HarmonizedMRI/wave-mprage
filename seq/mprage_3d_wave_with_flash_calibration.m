@@ -116,6 +116,15 @@ Ncalib1 = 72;
 Ncalib2 = 1;
 Nacs    = 32;
 
+% Calibration-only slab-selective excitation. The shared SAG geometry maps
+% the readout to Gz (ax.d1) and the excited slab to Gx (ax.d2). The slab
+% thickness therefore equals FOVx while MPRAGE keeps its original block RF.
+calibRfDuration    = 1.0e-3;     % [s]
+calibRfTBW         = 20;
+calibRfApodization = 0.42;
+calibSlabAxis      = ax.d2;      % Gx for SAG
+calibSlabThickness = fov(ax.n2); % FOVx = 192 mm by default
+
 assert(Ncalib1 == round(Ncalib1) && Ncalib1 > 0, ...
     'Ncalib1 must be a positive integer.');
 assert(Ncalib2 == round(Ncalib2) && Ncalib2 > 0, ...
@@ -132,11 +141,18 @@ assert(Ndummy >= 0 && Ndummy == round(Ndummy), ...
     'Ndummy must be a nonnegative integer.');
 assert(NsettlePerPart >= 0 && NsettlePerPart == round(NsettlePerPart), ...
     'NsettlePerPart must be a nonnegative integer.');
+assert(strcmp(ax.d1, 'z'), ...
+    'SAG calibration requires the shared readout axis ax.d1 to be z.');
+assert(strcmp(calibSlabAxis, 'x'), ...
+    'SAG calibration requires the slab-select axis ax.d2 to be x.');
+assert(abs(calibSlabThickness - fov(1)) <= ...
+    10*eps(max(1, abs(fov(1)))), ...
+    'Calibration slab thickness must equal the shared FOVx.');
 
 %% MPRAGE-only parameters
 TI    = 1.1;
 TRout = 2.5;
-R1 = 2;                           % acceleration along ax.d2 / PAR
+R1 = 1;                           % acceleration along ax.d2 / PAR
 R2 = 3;                           % acceleration along ax.d3 / LIN
 ETLtarget = 192;
 
@@ -561,6 +577,64 @@ nMprageAdc = numel(expectedLIN_img);
 assert(nMprageAdc == nImgRealSlots, ...
     'MPRAGE expected ADC count does not match scheduler count.');
 
+%% Calibration-only slab-selective RF and constant-TR timing
+% MPRAGE above is intentionally unchanged. Calibration uses a separate sinc
+% RF pulse and slab-select/rephasing gradients, while reusing the exact same
+% ADC, readout gradient, readout duration, and wave-pre/post event tables.
+[rfCal, gCalSs, gCalSsReph] = mr.makeSincPulse(alpha*pi/180, sys_lowPNS, ...
+    'Duration', calibRfDuration, ...
+    'SliceThickness', calibSlabThickness, ...
+    'apodization', calibRfApodization, ...
+    'timeBwProduct', calibRfTBW, ...
+    'use', 'excitation');
+
+% makeSincPulse creates conventional z-channel slice gradients. For the
+% shared SAG mapping, remap both events to Gx = ax.d2.
+gCalSs.channel = calibSlabAxis;
+gCalSsReph.channel = calibSlabAxis;
+adcCal = adc;
+
+assert(strcmp(gCalSs.channel, 'x') && strcmp(gCalSsReph.channel, 'x'), ...
+    'Calibration slab-select and rephasing gradients must both use Gx.');
+assert(strcmp(gro.channel, 'z'), ...
+    'Calibration and MPRAGE readout gradients must both use Gz.');
+assert(adcCal.numSamples == adc.numSamples && ...
+    abs(adcCal.dwell-adc.dwell) <= eps(max(1, abs(adc.dwell))), ...
+    'Calibration ADC must exactly match the MPRAGE ADC sampling.');
+
+% Every calibration repetition uses the same four-block structure:
+% RF/slab select, standalone slab rephaser, shared readout/prephasers, and a
+% duration-padded shared spoiler/rewinder block. This keeps calibration TR
+% identical across no-wave, sine-wave, cosine-wave, dummy, settling, and
+% acquired repetitions.
+calibPostDurations = [mr.calcDuration(groSp), allPostDur];
+calibPostBlockDur = ceil(max(calibPostDurations)/sys.gradRasterTime) ...
+    * sys.gradRasterTime;
+calibRfBlockDur = mr.calcDuration(rfCal, gCalSs);
+calibSlabRephDur = mr.calcDuration(gCalSsReph);
+calibReadBlockDur = max([mr.calcDuration(gro1), mr.calcDuration(adcCal)]);
+calibTR = calibRfBlockDur + calibSlabRephDur ...
+    + calibReadBlockDur + calibPostBlockDur;
+calibTE = calibRfBlockDur - (rfCal.delay + mr.calcRfCenter(rfCal)) ...
+    + calibSlabRephDur + adcCal.delay ...
+    + adcCal.dwell*(adcCal.numSamples/2+0.5);
+
+fprintf(['Calibration slab RF: axis=%s, thickness=%.3f mm, duration=%.3f ms, ', ...
+         'TBW=%.3g, apodization=%.3g.\n'], ...
+    calibSlabAxis, calibSlabThickness*1e3, calibRfDuration*1e3, ...
+    calibRfTBW, calibRfApodization);
+fprintf(['Calibration timing: RF block=%.6f ms, slab rephaser=%.6f ms, ', ...
+         'readout block=%.6f ms, post block=%.6f ms, TE=%.6f ms, TR=%.6f ms.\n'], ...
+    calibRfBlockDur*1e3, calibSlabRephDur*1e3, ...
+    calibReadBlockDur*1e3, calibPostBlockDur*1e3, ...
+    calibTE*1e3, calibTR*1e3);
+
+% Register calibration-only invariant objects after the complete MPRAGE
+% acquisition has already been added to the sequence.
+gCalSs.id = seq.registerGradEvent(gCalSs);
+gCalSsReph.id = seq.registerGradEvent(gCalSsReph);
+[~, rfCal.shapeIDs] = seq.registerRfEvent(rfCal);
+
 %% FLASH calibration acquisition table
 ky_calib1 = centerBlockIndices(N(ax.n3), Ncalib1);
 ky_calib2 = centerBlockIndices(N(ax.n3), Ncalib2);
@@ -663,12 +737,11 @@ lblRefOn = mr.makeLabel('SET', 'REF', true);
 
 %% Add FLASH calibration to refscan
 % All five calibration SETs are marked REF=true. IMA remains false.
-fprintf('Adding FLASH calibration reference acquisition...\n');
-rf_phase = 0;
-rf_inc = 0;
-prevMode = [];
-prevI = [];
-prevJ = [];
+% Each repetition has the same four-block duration and uses the shared
+% MPRAGE readout/wave events without modifying the MPRAGE acquisition.
+fprintf('Adding slab-selective FLASH calibration reference acquisition...\n');
+rfCalPhase = 0;
+rfCalInc = 0;
 dummyTableIdx = mod((-Ndummy:-1), numel(calAcqTable)) + 1;
 tic;
 
@@ -678,23 +751,17 @@ for kk = 1:numel(dummyTableIdx)
     iPhys = row.iPhys;
     jPhys = row.jPhys;
 
-    rf.phaseOffset = rf_phase/180*pi;
-    adc.phaseOffset = rf_phase/180*pi;
-    rf_inc = mod(rf_inc + rfSpoilingInc, 360.0);
-    rf_phase = mod(rf_phase + rf_inc, 360.0);
+    rfCal.phaseOffset = rfCalPhase/180*pi;
+    adcCal.phaseOffset = rfCalPhase/180*pi;
+    rfCalInc = mod(rfCalInc + rfSpoilingInc, 360.0);
+    rfCalPhase = mod(rfCalPhase + rfCalInc, 360.0);
 
-    if isempty(prevMode)
-        seq.addBlock(rf);
-    else
-        seq.addBlock(rf, groSp, ...
-            gpe1PostByMode{prevMode}{prevI}, ...
-            gpe2PostByMode{prevMode}{prevJ});
-    end
+    seq.addBlock(rfCal, gCalSs);
+    seq.addBlock(gCalSsReph);
     seq.addBlock(gro1, ...
         gpe1PreByMode{mode}{iPhys}, gpe2PreByMode{mode}{jPhys});
-    prevMode = mode;
-    prevI = iPhys;
-    prevJ = jPhys;
+    seq.addBlock(mr.makeDelay(calibPostBlockDur), groSp, ...
+        gpe1PostByMode{mode}{iPhys}, gpe2PostByMode{mode}{jPhys});
 end
 
 for p = 1:numel(calParts)
@@ -707,24 +774,19 @@ for p = 1:numel(calParts)
             iPhys = row.iPhys;
             jPhys = row.jPhys;
 
-            rf.phaseOffset = rf_phase/180*pi;
-            adc.phaseOffset = rf_phase/180*pi;
-            rf_inc = mod(rf_inc + rfSpoilingInc, 360.0);
-            rf_phase = mod(rf_phase + rf_inc, 360.0);
+            rfCal.phaseOffset = rfCalPhase/180*pi;
+            adcCal.phaseOffset = rfCalPhase/180*pi;
+            rfCalInc = mod(rfCalInc + rfSpoilingInc, 360.0);
+            rfCalPhase = mod(rfCalPhase + rfCalInc, 360.0);
 
-            if isempty(prevMode)
-                seq.addBlock(rf);
-            else
-                seq.addBlock(rf, groSp, ...
-                    gpe1PostByMode{prevMode}{prevI}, ...
-                    gpe2PostByMode{prevMode}{prevJ});
-            end
+            seq.addBlock(rfCal, gCalSs);
+            seq.addBlock(gCalSsReph);
             seq.addBlock(gro1, ...
                 gpe1PreByMode{mode}{iPhys}, ...
                 gpe2PreByMode{mode}{jPhys});
-            prevMode = mode;
-            prevI = iPhys;
-            prevJ = jPhys;
+            seq.addBlock(mr.makeDelay(calibPostBlockDur), groSp, ...
+                gpe1PostByMode{mode}{iPhys}, ...
+                gpe2PostByMode{mode}{jPhys});
         end
     end
 
@@ -734,31 +796,21 @@ for p = 1:numel(calParts)
         iPhys = row.iPhys;
         jPhys = row.jPhys;
 
-        rf.phaseOffset = rf_phase/180*pi;
-        adc.phaseOffset = rf_phase/180*pi;
-        rf_inc = mod(rf_inc + rfSpoilingInc, 360.0);
-        rf_phase = mod(rf_phase + rf_inc, 360.0);
+        rfCal.phaseOffset = rfCalPhase/180*pi;
+        adcCal.phaseOffset = rfCalPhase/180*pi;
+        rfCalInc = mod(rfCalInc + rfSpoilingInc, 360.0);
+        rfCalPhase = mod(rfCalPhase + rfCalInc, 360.0);
 
-        if isempty(prevMode)
-            seq.addBlock(rf);
-        else
-            seq.addBlock(rf, groSp, ...
-                gpe1PostByMode{prevMode}{prevI}, ...
-                gpe2PostByMode{prevMode}{prevJ});
-        end
-
-        seq.addBlock(adc, gro1, ...
+        seq.addBlock(rfCal, gCalSs);
+        seq.addBlock(gCalSsReph);
+        seq.addBlock(adcCal, gro1, ...
             gpe1PreByMode{mode}{iPhys}, gpe2PreByMode{mode}{jPhys}, ...
             lblPAR_cal{row.iLocal}, lblLIN_cal{row.jLocal}, ...
             lblSET_cal{p}, lblECO_cal, lblRefOn, lblImaOff);
-
-        prevMode = mode;
-        prevI = iPhys;
-        prevJ = jPhys;
+        seq.addBlock(mr.makeDelay(calibPostBlockDur), groSp, ...
+            gpe1PostByMode{mode}{iPhys}, gpe2PostByMode{mode}{jPhys});
     end
 end
-seq.addBlock(groSp, ...
-    gpe1PostByMode{prevMode}{prevI}, gpe2PostByMode{prevMode}{prevJ});
 
 fprintf('FLASH calibration blocks added in %g seconds.\n', toc);
 fprintf('Calibration RF excitations: %d dummy + %d settling + %d acquired.\n', ...
@@ -926,8 +978,20 @@ seq.setDefinition('MPRAGE_UseWaveSin', double(isUseWave_sin));
 seq.setDefinition('MPRAGE_HasSeparateACS', 0);
 
 % Calibration/refscan definitions.
-seq.setDefinition('Calibration_TRinner', TRinner);
-seq.setDefinition('Calibration_TE', TE);
+seq.setDefinition('Calibration_TRinner', calibTR);
+seq.setDefinition('Calibration_TE', calibTE);
+seq.setDefinition('Calibration_RFType', 'slab_selective_sinc');
+seq.setDefinition('Calibration_RFDuration', calibRfDuration);
+seq.setDefinition('Calibration_RFTBW', calibRfTBW);
+seq.setDefinition('Calibration_RFApodization', calibRfApodization);
+seq.setDefinition('Calibration_SlabAxis', calibSlabAxis);
+seq.setDefinition('Calibration_SlabThickness', calibSlabThickness);
+seq.setDefinition('Calibration_ReadoutAxis', ax.d1);
+seq.setDefinition('Calibration_ReadoutDuration', ro_dur);
+seq.setDefinition('Calibration_ReadoutSamples', adcCal.numSamples);
+seq.setDefinition('Calibration_WaveAmplitude_mTm', gwave_max);
+seq.setDefinition('Calibration_WaveSlew_Tms', swave_max);
+seq.setDefinition('Calibration_WaveCycles', Ncycles);
 seq.setDefinition('Calibration_Ndummy', Ndummy);
 seq.setDefinition('Calibration_NsettlePerPart', NsettlePerPart);
 seq.setDefinition('Calibration_Ncalib1', Ncalib1);
