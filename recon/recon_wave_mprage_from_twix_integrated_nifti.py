@@ -25,11 +25,14 @@ Notes:
       images using orientation from the input MPRAGE TWIX file.
 """
 
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from scipy import io
+from scipy.optimize import least_squares
+from scipy.signal import lombscargle
 import pypulseq as pp
 
 import platform
@@ -94,6 +97,9 @@ def main():
     twix_coord_system = cfg["twix_coord_system"]
     twix_inplane_rot_sign = cfg["twix_inplane_rot_sign"]
     twix_use_fov_for_voxel_size = cfg["twix_use_fov_for_voxel_size"]
+    psf_coefficient_processing = cfg["psf_coefficient_processing"]
+    psf_fit_kx_min = cfg["psf_fit_kx_min"]
+    psf_fit_kx_max = cfg["psf_fit_kx_max"]
 
     seq = pp.Sequence()
     seq.read(mprage_seq_file, remove_duplicates=False)
@@ -116,7 +122,8 @@ def main():
     Nx_os = Nx * os_factor
     ncalib = int(defs.get('Calibration_Ncalib1', 72))
     nacs = int(defs.get('Calibration_Nacs', 32))
-    slice_orientation = defs.get('OrientationMapping', 'SAG')
+    slice_orientation = _assert_sag_geometry(defs)
+    nifti_voxel_size_mm = _derive_nifti_voxel_size_mm(defs, geom)
 
     print("Integrated Wave-MPRAGE reconstruction")
     print(f"  Physical matrix: Nx_phys={geom['Nxyz'][0]}, Ny_phys={geom['Nxyz'][1]}, Nz_phys={geom['Nxyz'][2]}")
@@ -128,12 +135,27 @@ def main():
     print(f"  Integrated calib: Ncalib={ncalib}, Nacs={nacs}")
     if save_nifti:
         print(f"  NIfTI export:    enabled -> {nifti_out_folder}")
+        print(
+            "  NIfTI voxel size: "
+            f"{nifti_voxel_size_mm[0]:g} x {nifti_voxel_size_mm[1]:g} x "
+            f"{nifti_voxel_size_mm[2]:g} mm"
+        )
 
     print("Importing image data from integrated TWIX file...")
     img = load_img(mprage_data_file)
     if not torch.is_tensor(img):
         img = torch.as_tensor(img)
     _check_image_data_shape(img, Nx_os, Ny, Nz)
+    geometry_diagnostics = _report_seq_twix_geometry(
+        twix_file=mprage_data_file,
+        geom=geom,
+        received_image_shape=tuple(int(v) for v in img.shape),
+        os_factor=os_factor,
+        voxel_size_mm=nifti_voxel_size_mm,
+        twix_array_axis_roles=nifti_axis_roles,
+        twix_coord_system=twix_coord_system,
+        twix_inplane_rot_sign=twix_inplane_rot_sign,
+    )
     Ncoil = int(img.shape[-1])
 
     print("Preparing coil compression matrix and coil sensitivity maps...")
@@ -198,6 +220,9 @@ def main():
             Ncalib=ncalib,
             Nacs=nacs,
             slice_orientation=slice_orientation,
+            coefficient_processing=psf_coefficient_processing,
+            fit_kx_min=psf_fit_kx_min,
+            fit_kx_max=psf_fit_kx_max,
         )
         print("Generated calibrated PSF")
 
@@ -231,7 +256,7 @@ def main():
                 suffix=nifti_suffix,
                 tag_wave=tag_wave,
                 file_tag=file_tag,
-                voxel_size_mm=(res_x * 1e3, res_y * 1e3, res_z * 1e3),
+                voxel_size_mm=nifti_voxel_size_mm,
                 crop_readout_os=os_factor,
                 save_phase=save_nifti_phase,
                 twix_array_axis_roles=nifti_axis_roles,
@@ -251,6 +276,10 @@ def main():
                     nacs=nacs,
                     yflip=yflip,
                     zflip=zflip,
+                    voxel_size_mm=nifti_voxel_size_mm,
+                    geometry_diagnostics=geometry_diagnostics,
+                    psf_coefficient_processing=psf_coefficient_processing,
+                    psf_fit_kx_range=(psf_fit_kx_min, psf_fit_kx_max),
                 ),
             )
 
@@ -316,7 +345,7 @@ def main():
                 suffix=nifti_suffix,
                 tag_wave=tag_wave,
                 file_tag=file_tag,
-                voxel_size_mm=(res_x * 1e3, res_y * 1e3, res_z * 1e3),
+                voxel_size_mm=nifti_voxel_size_mm,
                 crop_readout_os=os_factor,
                 save_phase=save_nifti_phase,
                 twix_array_axis_roles=nifti_axis_roles,
@@ -336,6 +365,10 @@ def main():
                     nacs=nacs,
                     yflip=yflip,
                     zflip=zflip,
+                    voxel_size_mm=nifti_voxel_size_mm,
+                    geometry_diagnostics=geometry_diagnostics,
+                    psf_coefficient_processing=None,
+                    psf_fit_kx_range=None,
                 ),
             )
 
@@ -457,8 +490,24 @@ def _default_nifti_sub(tag_wave, res_x, res_y, res_z, Ry, Rz, file_tag):
     return _sanitize_filename_component(tag)
 
 
-def _build_mprage_nifti_metadata(tag_wave, file_tag, defs, geom, os_factor, Ry, Rz, ncalib, nacs, yflip, zflip):
-    """Create MPRAGE-specific JSON sidecar metadata."""
+def _build_mprage_nifti_metadata(
+    tag_wave,
+    file_tag,
+    defs,
+    geom,
+    os_factor,
+    Ry,
+    Rz,
+    ncalib,
+    nacs,
+    yflip,
+    zflip,
+    voxel_size_mm,
+    geometry_diagnostics=None,
+    psf_coefficient_processing=None,
+    psf_fit_kx_range=None,
+):
+    """Create metadata without feeding sidecar values back into reconstruction."""
     metadata = {
         "Modality": "MR",
         "PulseSequenceType": "MPRAGE",
@@ -473,33 +522,119 @@ def _build_mprage_nifti_metadata(tag_wave, file_tag, defs, geom, os_factor, Ry, 
         "Ncalib": int(ncalib),
         "Nacs": int(nacs),
         "PSFSignConvention": {"yflip": int(yflip), "zflip": int(zflip)},
-        "LogicalReconAxisOrder": ["readout_physical_z", "LIN_outerPE_physical_y", "PAR_innerPE_physical_x"],
+        "LogicalReconAxisOrder": [
+            "readout_physical_z",
+            "LIN_outerPE_physical_y",
+            "PAR_innerPE_physical_x",
+        ],
         "PhysicalMatrixXYZ": [int(v) for v in geom["Nxyz"]],
         "LogicalMatrixRO_LIN_PAR": [int(geom["Nro"]), int(geom["Nlin"]), int(geom["Npar"])],
-        "PhysicalFovMXYZ": [float(v) for v in geom["FOVxyz"]],
-        "LogicalFovMRO_LIN_PAR": [float(geom["FOVro"]), float(geom["FOVlin"]), float(geom["FOVpar"])],
+        "PhysicalFOVMXYZ": [float(v) for v in geom["FOVxyz"]],
+        "PhysicalFOVMmXYZ": [float(v) * 1e3 for v in geom["FOVxyz"]],
+        "LogicalFOVMRO_LIN_PAR": [float(geom["FOVro"]), float(geom["FOVlin"]), float(geom["FOVpar"])],
+        "LogicalFOVMmRO_LIN_PAR": [
+            float(geom["FOVro"]) * 1e3,
+            float(geom["FOVlin"]) * 1e3,
+            float(geom["FOVpar"]) * 1e3,
+        ],
+        "VoxelSizeMmRO_LIN_PAR": [float(v) for v in voxel_size_mm],
+        "NIfTIVoxelSizeSource": "Pulseq definitions, checked against TWIX geometry",
     }
 
-    optional_defs = {
-        "TR": "RepetitionTime",
-        "TE": "EchoTime",
-        "TI": "InversionTime",
-        "FlipAngle": "FlipAngle",
+    # Metadata-only lookups. Current sequence timing definitions are seconds;
+    # FlipAngle is degrees. Missing optional fields are omitted, not defaulted.
+    repetition_time = _first_finite_definition(defs, "MPRAGE_TRout", "TR")
+    if repetition_time is not None:
+        metadata["RepetitionTime"] = repetition_time
+        metadata["RepetitionTimeUnits"] = "s"
+
+    echo_time = _first_finite_definition(defs, "TE")
+    if echo_time is not None:
+        metadata["EchoTime"] = echo_time
+        metadata["EchoTimeUnits"] = "s"
+
+    inversion_time = _first_finite_definition(defs, "MPRAGE_TI", "TI")
+    if inversion_time is not None:
+        metadata["InversionTime"] = inversion_time
+        metadata["InversionTimeUnits"] = "s"
+
+    inner_tr = _first_finite_definition(defs, "MPRAGE_TRinner")
+    if inner_tr is not None:
+        metadata["MPRAGEInnerRepetitionTime"] = inner_tr
+        metadata["MPRAGEInnerRepetitionTimeUnits"] = "s"
+
+    flip_angle = _first_finite_definition(defs, "FlipAngle")
+    if flip_angle is not None:
+        metadata["FlipAngle"] = flip_angle
+        metadata["FlipAngleUnits"] = "degree"
+
+    scalar_defs = {
         "Name": "PulseqSequenceName",
         "OrientationMapping": "PulseqOrientationMapping",
+        "ReadoutAxis": "PulseqReadoutPhysicalAxis",
+        "InnerPEAxis": "PulseqInnerPhaseEncodingPhysicalAxis",
+        "OuterPEAxis": "PulseqOuterPhaseEncodingPhysicalAxis",
+        "MPRAGE_ETL_Target": "EchoTrainLength",
+        "Calibration_RFType": "CalibrationRFType",
+        "Calibration_SlabAxis": "CalibrationSlabPhysicalAxis",
     }
-    for seq_key, meta_key in optional_defs.items():
+    for seq_key, meta_key in scalar_defs.items():
         if seq_key in defs:
-            value = defs.get(seq_key)
-            try:
-                if np.isscalar(value) and seq_key != "Name" and seq_key != "OrientationMapping":
-                    value = float(value)
-            except Exception:
-                pass
-            metadata[meta_key] = value
+            metadata[meta_key] = _json_scalar(defs.get(seq_key))
 
+    numeric_calibration_defs = {
+        "Calibration_TRinner": ("CalibrationRepetitionTime", "s"),
+        "Calibration_TE": ("CalibrationEchoTime", "s"),
+        "Calibration_RFDuration": ("CalibrationRFDuration", "s"),
+        "Calibration_RFTBW": ("CalibrationRFTBW", None),
+        "Calibration_SlabThickness": ("CalibrationSlabThickness", "m"),
+        "Calibration_ReadoutDuration": ("CalibrationReadoutDuration", "s"),
+        "Calibration_ReadoutSamples": ("CalibrationReadoutSamples", None),
+        "Calibration_WaveAmplitude_mTm": ("CalibrationWaveAmplitude", "mT/m"),
+        "Calibration_WaveCycles": ("CalibrationWaveCycles", None),
+        "Calibration_Ncalib1": ("CalibrationNcalib1", None),
+        "Calibration_Ncalib2": ("CalibrationNcalib2", None),
+        "Calibration_Nacs": ("CalibrationNacs", None),
+    }
+    for seq_key, (meta_key, unit) in numeric_calibration_defs.items():
+        value = _first_finite_definition(defs, seq_key)
+        if value is not None:
+            metadata[meta_key] = value
+            if unit is not None:
+                metadata[meta_key + "Units"] = unit
+
+    if geometry_diagnostics is not None:
+        metadata["GeometryDiagnostics"] = geometry_diagnostics
+        metadata["PhaseEncodingDirections"] = geometry_diagnostics.get("Directions", {})
+
+    if tag_wave == "wave" and psf_coefficient_processing is not None:
+        metadata["PSFCoefficientProcessing"] = str(psf_coefficient_processing)
+        if psf_coefficient_processing == "sine-line" and psf_fit_kx_range is not None:
+            metadata["PSFFitKxRange"] = [int(psf_fit_kx_range[0]), int(psf_fit_kx_range[1])]
+            metadata["PSFFitKxRangeConvention"] = "half-open [min, max)"
+            metadata["PSFFitModel"] = "A*sin(w*kx+phi)+C1*kx+C2"
     return metadata
 
+
+def _json_scalar(value):
+    """Convert a Pulseq scalar to a JSON-safe Python scalar."""
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _first_finite_definition(defs, *keys):
+    """Return the first finite scalar definition, without inserting a default."""
+    for key in keys:
+        if key not in defs:
+            continue
+        try:
+            value = float(defs.get(key))
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(value):
+            return value
+    return None
 
 def _sanitize_filename_component(value):
     """Return a filesystem-friendly component for generated NIfTI names."""
@@ -969,9 +1104,162 @@ def fit_wave_psf_deviation_from_projection(mprage_data_file, mprage_seq_file, ou
     return a_fit, b_fit, c_fit, Nacs_total
 
 
+def _sine_line_model(t, A, w, phi, C1, C2):
+    """Evaluate A*sin(w*t + phi) + C1*t + C2."""
+    return A * np.sin(w * t + phi) + C1 * t + C2
+
+
+def _fit_sine_plus_line(t, values):
+    """Fit a sine plus linear trend to finite samples in one coefficient."""
+    t = np.asarray(t, dtype=float).ravel()
+    values = np.asarray(values, dtype=float).ravel()
+    valid = np.isfinite(t) & np.isfinite(values)
+    t = t[valid]
+    values = values[valid]
+    if t.size < 6:
+        raise ValueError("At least 6 finite coefficient samples are required for sine-line PSF processing.")
+    order = np.argsort(t)
+    t = t[order]
+    values = values[order]
+    if np.ptp(t) == 0:
+        raise ValueError("PSF fit kx coordinates must contain more than one distinct value.")
+
+    t_ref = float(np.mean(t))
+    x = t - t_ref
+    span = float(np.ptp(x))
+    unique_dt = np.diff(np.unique(t))
+    median_dt = float(np.median(unique_dt))
+    w_min = 2.0 * np.pi / span
+    w_max = np.pi / median_dt
+
+    C1_initial, C2_ref_initial = np.polyfit(x, values, 1)
+    detrended = values - (C1_initial * x + C2_ref_initial)
+    detrended -= np.mean(detrended)
+    w_grid = np.linspace(w_min, w_max, 10000)
+    power = lombscargle(x, detrended, w_grid, precenter=False, normalize=True)
+    w_initial = float(w_grid[int(np.argmax(power))])
+
+    design = np.column_stack([
+        np.sin(w_initial * x),
+        np.cos(w_initial * x),
+        x,
+        np.ones_like(x),
+    ])
+    sine_coef, cosine_coef, C1_initial, C2_ref_initial = np.linalg.lstsq(
+        design, values, rcond=None
+    )[0]
+    A_initial = float(np.hypot(sine_coef, cosine_coef))
+    phi_ref_initial = float(np.arctan2(cosine_coef, sine_coef))
+    initial = np.array([
+        max(A_initial, np.finfo(float).eps),
+        w_initial,
+        phi_ref_initial,
+        C1_initial,
+        C2_ref_initial,
+    ])
+
+    def residuals(parameters):
+        A, w, phi_ref, C1, C2_ref = parameters
+        return A * np.sin(w * x + phi_ref) + C1 * x + C2_ref - values
+
+    result = least_squares(
+        residuals,
+        initial,
+        bounds=(
+            [0.0, w_min, -np.inf, -np.inf, -np.inf],
+            [np.inf, w_max, np.inf, np.inf, np.inf],
+        ),
+        method="trf",
+        x_scale="jac",
+        loss="linear",
+    )
+    A, w, phi_ref, C1, C2_ref = result.x
+    phi = (phi_ref - w * t_ref + np.pi) % (2.0 * np.pi) - np.pi
+    C2 = C2_ref - C1 * t_ref
+    return {
+        "A": float(A),
+        "w": float(w),
+        "phi": float(phi),
+        "C1": float(C1),
+        "C2": float(C2),
+        "success": bool(result.success),
+        "message": str(result.message),
+        "n_samples": int(t.size),
+    }
+
+
+def _process_psf_coefficients(
+    a_raw,
+    b_raw,
+    c_raw,
+    Nx_os,
+    coefficient_processing="smooth",
+    fit_kx_min=None,
+    fit_kx_max=None,
+    out_folder=None,
+    file_tag="",
+):
+    """Apply mutually exclusive smoothing or sine-line coefficient processing."""
+    mode = str(coefficient_processing).strip().lower()
+    if mode == "smooth":
+        return (
+            smooth_1d_nan(a_raw, window=9),
+            smooth_1d_nan(b_raw, window=9),
+            smooth_1d_nan(c_raw, window=9),
+        )
+    if mode != "sine-line":
+        raise ValueError("coefficient_processing must be 'smooth' or 'sine-line'.")
+    if fit_kx_min is None or fit_kx_max is None:
+        raise ValueError("sine-line PSF processing requires fit_kx_min and fit_kx_max.")
+    fit_kx_min = int(fit_kx_min)
+    fit_kx_max = int(fit_kx_max)
+    if not (0 <= fit_kx_min < fit_kx_max <= int(Nx_os)):
+        raise ValueError(
+            f"PSF fit range must satisfy 0 <= min < max <= Nx_os; got "
+            f"[{fit_kx_min}, {fit_kx_max}) with Nx_os={Nx_os}."
+        )
+
+    kx_fit = np.arange(fit_kx_min, fit_kx_max, dtype=float)
+    kx_all = np.arange(int(Nx_os), dtype=float)
+    outputs = []
+    diagnostics = {}
+    for name, raw in (("a", a_raw), ("b", b_raw), ("c", c_raw)):
+        raw_1d = _squeeze_fit_vector(raw, name=f"{name}_raw")
+        params = _fit_sine_plus_line(
+            kx_fit,
+            raw_1d[fit_kx_min:fit_kx_max].detach().cpu().numpy(),
+        )
+        fitted = _sine_line_model(
+            kx_all,
+            params["A"],
+            params["w"],
+            params["phi"],
+            params["C1"],
+            params["C2"],
+        )
+        outputs.append(torch.as_tensor(fitted, dtype=raw_1d.dtype, device=raw_1d.device))
+        diagnostics[name] = params
+
+    if out_folder is not None:
+        diag_path = os.path.join(out_folder, f"psf_sine_line_fit_{file_tag}.json")
+        with open(diag_path, "w") as f:
+            json.dump(
+                {
+                    "model": "A*sin(w*kx+phi)+C1*kx+C2",
+                    "kx_range": [fit_kx_min, fit_kx_max],
+                    "kx_range_convention": "half-open",
+                    "coefficients": diagnostics,
+                },
+                f,
+                indent=2,
+            )
+        print(f"Saved sine-line PSF fit diagnostics: {diag_path}")
+    return tuple(outputs)
+
 def generate_calibrated_psf(mprage_data_file, mprage_seq_file, out_folder, Nx_os, Ny, Nz, file_tag,
                             yflip=-1, zflip=-1, Ncalib=72, Nacs=32,
-                            slice_orientation='SAG', psf_plot=True):
+                            slice_orientation='SAG', psf_plot=True,
+                            coefficient_processing='smooth', fit_kx_min=None, fit_kx_max=None):
     """Generate calibrated wave PSF from the integrated calibration module."""
     a_fit_all, b_fit_all, c_fit_all, Nacs_total = fit_wave_psf_deviation_from_projection(
         mprage_data_file=mprage_data_file,
@@ -985,9 +1273,17 @@ def generate_calibrated_psf(mprage_data_file, mprage_seq_file, out_folder, Nx_os
         slice_orientation=slice_orientation,
     )
 
-    a_smooth = smooth_1d_nan(a_fit_all, window=9)
-    b_smooth = smooth_1d_nan(b_fit_all, window=9)
-    c_smooth = smooth_1d_nan(c_fit_all, window=9)
+    a_smooth, b_smooth, c_smooth = _process_psf_coefficients(
+        a_fit_all,
+        b_fit_all,
+        c_fit_all,
+        Nx_os=Nx_os,
+        coefficient_processing=coefficient_processing,
+        fit_kx_min=fit_kx_min,
+        fit_kx_max=fit_kx_max,
+        out_folder=out_folder,
+        file_tag=file_tag,
+    )
 
     a_fit = _squeeze_fit_vector(a_smooth, name='a_smooth')
     b_fit = _squeeze_fit_vector(b_smooth, name='b_smooth')
@@ -1003,7 +1299,7 @@ def generate_calibrated_psf(mprage_data_file, mprage_seq_file, out_folder, Nx_os
         plt.legend()
         plt.ylim([-3, 3])
         plt.xlim([0, Nx_os])
-        plt.title('Integrated PSF calibration fit')
+        plt.title(f'Integrated PSF calibration fit ({coefficient_processing})')
         fig_path = out_folder + 'psf_integrated_calib_fit_' + file_tag + '.png'
         print(f"Saving PSF calibration fit plot to: {fig_path}")
         plt.savefig(fig_path)
@@ -1148,13 +1444,35 @@ def _parse_cli_args():
         ),
     )
     parser.add_argument("--nifti-axis-flips", default=None,
-                        help="Comma-separated booleans for physical array flips before NIfTI. Default: false,true,false.")
+                        help="Comma-separated booleans for physical array flips before NIfTI. Default: true,false,false.")
     parser.add_argument("--twix-coord-system", default=None, choices=("LPS", "RAS"),
                         help="Coordinate-system assumption for Twix Sag/Cor/Tra vectors. Default: LPS.")
     parser.add_argument("--twix-inplane-rot-sign", type=float, default=None,
                         help="Sign applied to Twix in-plane rotation. Default: -1.0.")
     parser.add_argument("--twix-use-fov-for-voxel-size", action="store_true",
                         help="Infer NIfTI voxel sizes from Twix FOV instead of reconstruction voxel size.")
+    parser.add_argument(
+        "--psf-coefficient-processing",
+        choices=("smooth", "sine-line"),
+        default="smooth",
+        help=(
+            "Post-process fitted PSF coefficients with the existing NaN-aware smoothing "
+            "or replace smoothing with a sine-plus-line fit. Default: smooth."
+        ),
+    )
+    parser.add_argument(
+        "--psf-fit-kx-min",
+        type=int,
+        default=None,
+        help="Inclusive first oversampled-readout index for sine-line PSF fitting.",
+    )
+    parser.add_argument(
+        "--psf-fit-kx-max",
+        type=int,
+        default=None,
+        help="Exclusive final oversampled-readout index for sine-line PSF fitting.",
+    )
+
     return parser.parse_args()
 
 
@@ -1324,7 +1642,7 @@ def _collect_runtime_config():
     axis_roles_source = cli.nifti_axis_roles
     if axis_roles_source is None and "nifti_axis_roles" in globals() and globals()["nifti_axis_roles"] not in (None, ""):
         axis_roles_source = globals()["nifti_axis_roles"]
-    nifti_axis_roles_value = _parse_axis_roles(axis_roles_source, default=("readout", "phase", "slice"))
+    nifti_axis_roles_value = _parse_axis_roles(axis_roles_source, default=("phase", "readout", "slice"))
 
     axis_flips_source = cli.nifti_axis_flips
     if axis_flips_source is None and "nifti_axis_flips" in globals() and globals()["nifti_axis_flips"] not in (None, ""):
@@ -1345,6 +1663,25 @@ def _collect_runtime_config():
         twix_inplane_rot_sign_value = float(globals()["twix_inplane_rot_sign"])
     else:
         twix_inplane_rot_sign_value = -1.0
+
+    psf_coefficient_processing_value = str(cli.psf_coefficient_processing).strip().lower()
+    psf_fit_kx_min_value = cli.psf_fit_kx_min
+    psf_fit_kx_max_value = cli.psf_fit_kx_max
+    if psf_coefficient_processing_value == "sine-line":
+        if psf_fit_kx_min_value is None or psf_fit_kx_max_value is None:
+            raise ValueError(
+                "--psf-coefficient-processing sine-line requires both "
+                "--psf-fit-kx-min and --psf-fit-kx-max."
+            )
+        if psf_fit_kx_min_value < 0 or psf_fit_kx_max_value <= psf_fit_kx_min_value:
+            raise ValueError(
+                "PSF fit indices must satisfy 0 <= --psf-fit-kx-min < --psf-fit-kx-max."
+            )
+    elif psf_fit_kx_min_value is not None or psf_fit_kx_max_value is not None:
+        raise ValueError(
+            "--psf-fit-kx-min/--psf-fit-kx-max are only valid with "
+            "--psf-coefficient-processing sine-line."
+        )
 
     twix_use_fov_for_voxel_size_value = bool(
         cli.twix_use_fov_for_voxel_size or globals().get("twix_use_fov_for_voxel_size", False)
@@ -1396,6 +1733,9 @@ def _collect_runtime_config():
         "twix_coord_system": twix_coord_system_value,
         "twix_inplane_rot_sign": twix_inplane_rot_sign_value,
         "twix_use_fov_for_voxel_size": twix_use_fov_for_voxel_size_value,
+        "psf_coefficient_processing": psf_coefficient_processing_value,
+        "psf_fit_kx_min": psf_fit_kx_min_value,
+        "psf_fit_kx_max": psf_fit_kx_max_value,
     }
 
 
@@ -1485,6 +1825,237 @@ def _derive_hardcoded_sag_logical_geometry(defs):
         "par_axis": "x",
     }
 
+
+def _assert_sag_geometry(defs):
+    """Keep the current SAG-only reconstruction convention explicit."""
+    orientation = str(defs.get("OrientationMapping", "SAG")).strip().upper()
+    if orientation != "SAG":
+        raise ValueError(
+            f"This reconstruction is validated only for SAG geometry; got OrientationMapping={orientation!r}."
+        )
+    expected_axes = {
+        "ReadoutAxis": "z",
+        "InnerPEAxis": "x",
+        "OuterPEAxis": "y",
+    }
+    for key, expected in expected_axes.items():
+        if key not in defs:
+            print(f"Geometry diagnostic: .seq definition {key} is absent; using asserted SAG mapping {expected}.")
+            continue
+        actual = str(defs.get(key)).strip().lower()
+        if actual != expected:
+            raise ValueError(
+                f"SAG geometry assertion failed: {key}={actual!r}, expected {expected!r}."
+            )
+    return orientation
+
+
+def _derive_nifti_voxel_size_mm(defs, geom):
+    """Return logical RO/LIN/PAR spacing in mm without changing reconstruction geometry."""
+    from_fov_mm = np.asarray(
+        [geom["res_ro"], geom["res_lin"], geom["res_par"]], dtype=float
+    ) * 1e3
+    direct_values = []
+    for key in ("ResolutionZ_mm", "ResolutionY_mm", "ResolutionX_mm"):
+        value = _first_finite_definition(defs, key)
+        if value is None:
+            direct_values = []
+            break
+        direct_values.append(value)
+
+    if direct_values:
+        voxel_size_mm = np.asarray(direct_values, dtype=float)
+        if not np.allclose(voxel_size_mm, from_fov_mm, rtol=1e-3, atol=1e-4):
+            print(
+                "WARNING: .seq Resolution*_mm definitions disagree with FOV/matrix-derived spacing.\n"
+                f"  Resolution*_mm logical RO/LIN/PAR: {voxel_size_mm.tolist()} mm\n"
+                f"  FOV/matrix logical RO/LIN/PAR:    {from_fov_mm.tolist()} mm\n"
+                "  NIfTI export will use the explicit Resolution*_mm definitions."
+            )
+    else:
+        voxel_size_mm = from_fov_mm
+        print("NIfTI spacing: Resolution*_mm definitions unavailable; using FOV/matrix converted from m to mm.")
+
+    if not np.all(np.isfinite(voxel_size_mm)) or np.any(voxel_size_mm <= 0):
+        raise ValueError(f"Invalid NIfTI voxel size derived from .seq: {voxel_size_mm.tolist()} mm")
+    if np.any(voxel_size_mm < 0.05) or np.any(voxel_size_mm > 20.0):
+        raise ValueError(
+            "Implausible NIfTI voxel size in millimetres: "
+            f"{voxel_size_mm.tolist()}. This commonly indicates an m/mm/um conversion error."
+        )
+    return tuple(float(v) for v in voxel_size_mm)
+
+
+def _coerce_twix_fov_mm(raw_value, expected_mm):
+    """Choose whether a TWIX FOV is already mm or is represented in metres."""
+    if raw_value is None:
+        return None, "missing"
+    raw = float(raw_value)
+    candidates = ((raw, "raw-as-mm"), (raw * 1e3, "raw-as-m-converted-to-mm"))
+    value, interpretation = min(
+        candidates,
+        key=lambda item: abs(item[0] - expected_mm) / max(abs(expected_mm), 1e-12),
+    )
+    return float(value), interpretation
+
+
+def _direction_patient_string(vector_ras):
+    """Describe the positive direction of a RAS vector as an anatomical arrow."""
+    v = np.asarray(vector_ras, dtype=float)
+    if v.shape != (3,) or not np.all(np.isfinite(v)) or np.linalg.norm(v) == 0:
+        return "unknown"
+    axis = int(np.argmax(np.abs(v)))
+    positive = v[axis] >= 0
+    if axis == 0:
+        return "L->R" if positive else "R->L"
+    if axis == 1:
+        return "P->A" if positive else "A->P"
+    return "I->S" if positive else "S->I"
+
+
+def _report_seq_twix_geometry(
+    twix_file,
+    geom,
+    received_image_shape,
+    os_factor,
+    voxel_size_mm,
+    twix_array_axis_roles,
+    twix_array_axis_flips,
+    twix_coord_system,
+    twix_inplane_rot_sign,
+):
+    """Print a warning-only .seq/TWIX geometry and PE-direction diagnostic."""
+    from utils.nifti_export_twix import make_nifti_affine_from_twix
+
+    logical_shape = (int(geom["Nro"]), int(geom["Nlin"]), int(geom["Npar"]))
+    try:
+        _, _, twix_info = make_nifti_affine_from_twix(
+            twix_file=twix_file,
+            npy_shape=logical_shape,
+            twix_array_axis_roles=twix_array_axis_roles,
+            twix_array_axis_flips=(False, False, False),
+            twix_coord_system=twix_coord_system,
+            twix_inplane_rot_sign=twix_inplane_rot_sign,
+            twix_use_fov_for_voxel_size=False,
+            voxel_size_mm=voxel_size_mm,
+        )
+    except Exception as exc:
+        message = f"Unable to read TWIX geometry ({type(exc).__name__}: {exc})"
+        print("Sequence/TWIX geometry diagnostics (warning-only)")
+        print(f"  WARNING: {message}")
+        print("  Reconstruction will continue.")
+        return {
+            "Status": "warning",
+            "Passed": False,
+            "SequenceOrientation": "SAG",
+            "Error": message,
+            "FOVChecks": {},
+            "MatrixChecks": {},
+            "Directions": {
+                "ReadoutPhysicalAxis": "z",
+                "OuterPhaseEncodingPhysicalAxis": "y",
+                "InnerPhaseEncodingPhysicalAxis": "x",
+            },
+        }
+
+    expected_fov_by_axis_mm = np.asarray(
+        [geom["FOVro"], geom["FOVlin"], geom["FOVpar"]], dtype=float
+    ) * 1e3
+    axis_for_role = {role: axis for axis, role in enumerate(twix_array_axis_roles)}
+    twix_fov_raw = twix_info.get("FOVRaw", twix_info.get("FOV", {}))
+    fov_checks = {}
+    all_match = True
+    for role in ("readout", "phase", "slice"):
+        axis = axis_for_role[role]
+        expected_mm = float(expected_fov_by_axis_mm[axis])
+        raw = twix_fov_raw.get(role)
+        observed_mm, interpretation = _coerce_twix_fov_mm(raw, expected_mm)
+        match = observed_mm is not None and np.isclose(observed_mm, expected_mm, rtol=0.01, atol=0.5)
+        all_match = all_match and bool(match)
+        fov_checks[role] = {
+            "SequenceMm": expected_mm,
+            "TwixRaw": None if raw is None else float(raw),
+            "TwixInterpretedMm": observed_mm,
+            "TwixUnitInterpretation": interpretation,
+            "Match": bool(match),
+        }
+
+    received = tuple(int(v) for v in received_image_shape)
+    matrix_checks = {
+        "ExpectedLogicalRO": int(geom["Nro"]),
+        "ExpectedReadoutOversampled": int(geom["Nro"] * os_factor),
+        "ExpectedLogicalLIN": int(geom["Nlin"]),
+        "ExpectedLogicalPAR": int(geom["Npar"]),
+        "ReceivedReadoutSamples": received[0],
+        "ReceivedLINExtent": received[1],
+        "ReceivedPARExtent": received[2],
+        "ReadoutSamplesMatch": received[0] == int(geom["Nro"] * os_factor),
+        "ReceivedLINWithinSequenceMatrix": received[1] <= int(geom["Nlin"]),
+        "ReceivedPARWithinSequenceMatrix": received[2] <= int(geom["Npar"]),
+        "TwixHeaderMatrix": twix_info.get("Matrix", {}),
+    }
+    all_match = all_match and matrix_checks["ReadoutSamplesMatch"]
+    all_match = all_match and matrix_checks["ReceivedLINWithinSequenceMatrix"]
+    all_match = all_match and matrix_checks["ReceivedPARWithinSequenceMatrix"]
+
+    direction_by_role = {
+        "readout": twix_info.get("ReadoutDirectionRAS"),
+        "phase": twix_info.get("PhaseDirectionRAS"),
+        "slice": twix_info.get("SliceDirectionRAS"),
+    }
+    stored_direction_by_role = {role: list(vector) if vector is not None else None
+                                for role, vector in direction_by_role.items()}
+    for axis, role in enumerate(twix_array_axis_roles):
+        if bool(twix_array_axis_flips[axis]) and stored_direction_by_role[role] is not None:
+            stored_direction_by_role[role] = (-np.asarray(stored_direction_by_role[role], dtype=float)).tolist()
+    directions = {
+        "ReadoutPhysicalAxis": "z",
+        "OuterPhaseEncodingPhysicalAxis": "y",
+        "InnerPhaseEncodingPhysicalAxis": "x",
+        "ReadoutAcquisitionDirectionPatient": _direction_patient_string(direction_by_role["phase"]),
+        "OuterPhaseEncodingAcquisitionDirectionPatient": _direction_patient_string(direction_by_role["readout"]),
+        "InnerPhaseEncodingAcquisitionDirectionPatient": _direction_patient_string(direction_by_role["slice"]),
+        "ReadoutStoredPositiveDirectionPatient": _direction_patient_string(stored_direction_by_role["phase"]),
+        "OuterPhaseEncodingStoredPositiveDirectionPatient": _direction_patient_string(stored_direction_by_role["readout"]),
+        "InnerPhaseEncodingStoredPositiveDirectionPatient": _direction_patient_string(stored_direction_by_role["slice"]),
+        "ReadoutDirectionRAS": direction_by_role["phase"],
+        "OuterPhaseEncodingDirectionRAS": direction_by_role["readout"],
+        "InnerPhaseEncodingDirectionRAS": direction_by_role["slice"],
+        "ReadoutStoredDirectionRAS": stored_direction_by_role["phase"],
+        "OuterPhaseEncodingStoredDirectionRAS": stored_direction_by_role["readout"],
+        "InnerPhaseEncodingStoredDirectionRAS": stored_direction_by_role["slice"],
+    }
+
+    print("Sequence/TWIX geometry diagnostics (warning-only)")
+    print("  Orientation assertion: SAG")
+    for role, check in fov_checks.items():
+        status = "MATCH" if check["Match"] else "WARNING"
+        print(
+            f"  FOV {role:7s}: seq={check['SequenceMm']:g} mm, "
+            f"twix={check['TwixInterpretedMm']} mm "
+            f"({check['TwixUnitInterpretation']}) [{status}]"
+        )
+    print(
+        "  Matrix received: "
+        f"RO_os={received[0]}, LIN_extent={received[1]}, PAR_extent={received[2]}"
+    )
+    print(f"  Readout acquisition direction:        {directions['ReadoutAcquisitionDirectionPatient']}")
+    print(f"  Outer PE / LIN acquisition direction: {directions['OuterPhaseEncodingAcquisitionDirectionPatient']}")
+    print(f"  Inner PE / PAR acquisition direction: {directions['InnerPhaseEncodingAcquisitionDirectionPatient']}")
+    print(f"  Readout stored positive direction:     {directions['ReadoutStoredPositiveDirectionPatient']}")
+    print(f"  Outer PE / LIN stored direction:       {directions['OuterPhaseEncodingStoredPositiveDirectionPatient']}")
+    print(f"  Inner PE / PAR stored direction:       {directions['InnerPhaseEncodingStoredPositiveDirectionPatient']}")
+    if not all_match:
+        print("WARNING: one or more .seq/TWIX geometry diagnostics did not match; reconstruction will continue.")
+
+    return {
+        "Status": "match" if all_match else "warning",
+        "Passed": bool(all_match),
+        "SequenceOrientation": "SAG",
+        "FOVChecks": fov_checks,
+        "MatrixChecks": matrix_checks,
+        "Directions": directions,
+    }
 
 def _parse_axis_roles(value, default=("readout", "phase", "slice")):
     """Parse comma-separated NIfTI/Twix axis roles."""

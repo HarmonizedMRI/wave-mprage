@@ -14,6 +14,19 @@ from typing import Any, Iterable, Mapping, Sequence
 import numpy as np
 
 
+def _coerce_fov_to_mm(raw_value, expected_mm=None):
+    """Interpret a TWIX FOV as mm, checking a possible metres representation."""
+    if raw_value is None:
+        return None, "missing"
+    raw = float(raw_value)
+    if expected_mm is None or not np.isfinite(expected_mm) or expected_mm <= 0:
+        return raw, "raw-as-mm"
+    candidates = ((raw, "raw-as-mm"), (raw * 1e3, "raw-as-m-converted-to-mm"))
+    return min(
+        candidates,
+        key=lambda item: abs(item[0] - expected_mm) / max(abs(expected_mm), 1e-12),
+    )
+
 def _normalize(v: Sequence[float], name: str = "vector") -> np.ndarray:
     """Return a unit vector and raise if the vector has zero norm."""
     v = np.asarray(v, dtype=float)
@@ -175,13 +188,13 @@ def make_nifti_affine_from_twix(
     )
 
     Ns = str(slice_index)
-    fov = {
+    fov_raw = {
         "readout": _twix_get(yaps, ("sSliceArray", "asSlice", Ns, "dReadoutFOV"), None),
         "phase": _twix_get(yaps, ("sSliceArray", "asSlice", Ns, "dPhaseFOV"), None),
         "slice": _twix_get(yaps, ("sSliceArray", "asSlice", Ns, "dThickness"), None),
     }
     if twix_fov_override is not None:
-        fov.update(dict(twix_fov_override))
+        fov_raw.update(dict(twix_fov_override))
 
     normal_sct = np.array([
         _twix_get(yaps, ("sSliceArray", "asSlice", Ns, "sNormal", "dSag"), 0.0),
@@ -217,6 +230,33 @@ def make_nifti_affine_from_twix(
         "slice": slice_dir,
     }
     axis_for_role = {role: ax for ax, role in enumerate(twix_array_axis_roles)}
+
+    expected_fov_by_role = {}
+    if voxel_size_mm is not None:
+        voxel_size_mm = tuple(float(x) for x in voxel_size_mm)
+        if len(voxel_size_mm) != 3:
+            raise ValueError("voxel_size_mm must have length 3.")
+        for role in ("readout", "phase", "slice"):
+            ax = axis_for_role[role]
+            expected_fov_by_role[role] = voxel_size_mm[ax] * npy_shape[ax]
+
+    fov = {}
+    fov_unit_interpretation = {}
+    for role in ("readout", "phase", "slice"):
+        fov[role], fov_unit_interpretation[role] = _coerce_fov_to_mm(
+            fov_raw[role], expected_fov_by_role.get(role)
+        )
+
+    matrix = {
+        "BaseResolution": _twix_get(yaps, ("sKSpace", "lBaseResolution"), None),
+        "PhaseEncodingLines": _twix_get(yaps, ("sKSpace", "lPhaseEncodingLines"), None),
+        "Partitions": _twix_get(yaps, ("sKSpace", "lPartitions"), None),
+        "ReadoutOversamplingFactor": _twix_get(yaps, ("sKSpace", "dReadoutOversamplingFactor"), None),
+    }
+    matrix = {
+        key: None if value is None else float(value)
+        for key, value in matrix.items()
+    }
 
     if twix_use_fov_for_voxel_size:
         spacing_by_role = {}
@@ -267,6 +307,10 @@ def make_nifti_affine_from_twix(
 
     twix_info = {
         "FOV": {k: None if v is None else float(v) for k, v in fov.items()},
+        "FOVRaw": {k: None if v is None else float(v) for k, v in fov_raw.items()},
+        "FOVUnits": "mm",
+        "FOVUnitInterpretation": fov_unit_interpretation,
+        "Matrix": matrix,
         "NormalSagCorTra": normal_sct.tolist(),
         "PositionSagCorTra": position_sct.tolist(),
         "NormalRAS": normal_ras.tolist(),
@@ -390,7 +434,7 @@ def save_nifti_with_json(
     json_path: str | Path,
     metadata: Mapping[str, Any] | None = None,
 ) -> tuple[Path, Path]:
-    """Save one 3D float image to NIfTI plus a JSON sidecar."""
+    """Save one 3D float image to NIfTI plus a JSON sidecar and verify mm units."""
     try:
         import nibabel as nib
     except ImportError as exc:
@@ -403,23 +447,78 @@ def save_nifti_with_json(
 
     img = nib.Nifti1Image(np.asarray(image, dtype=np.float32), np.asarray(affine, dtype=float))
     img.header.set_xyzt_units(xyz="mm", t="sec")
-    voxel_size_mm = tuple(float(x) for x in nib.affines.voxel_sizes(img.affine))
-    img.header.set_zooms(voxel_size_mm)
+    expected_voxel_size_mm = tuple(float(x) for x in nib.affines.voxel_sizes(img.affine))
+    if any((not np.isfinite(v)) or v <= 0 for v in expected_voxel_size_mm):
+        raise ValueError(f"Invalid NIfTI affine voxel sizes: {expected_voxel_size_mm}")
+    if any(v < 0.05 or v > 20.0 for v in expected_voxel_size_mm):
+        raise ValueError(
+            f"Implausible NIfTI voxel size in mm: {expected_voxel_size_mm}. "
+            "This likely indicates an m/mm/um conversion error."
+        )
+    img.header.set_zooms(expected_voxel_size_mm)
     img.set_qform(img.affine, code=1)
     img.set_sform(img.affine, code=1)
     nib.save(img, str(nii_path))
 
+    # Re-open and validate exactly what ITK-SNAP and other readers receive.
+    saved = nib.load(str(nii_path))
+    spatial_unit, temporal_unit = saved.header.get_xyzt_units()
+    raw_xyzt_units = int(np.asarray(saved.header["xyzt_units"]).item())
+    saved_zooms = tuple(float(v) for v in saved.header.get_zooms()[:3])
+    affine_zooms = tuple(float(v) for v in nib.affines.voxel_sizes(saved.affine))
+    qform, qform_code = saved.get_qform(coded=True)
+    sform, sform_code = saved.get_sform(coded=True)
+
+    if spatial_unit != "mm":
+        raise RuntimeError(
+            f"Saved NIfTI spatial unit is {spatial_unit!r}, expected 'mm' "
+            f"(raw xyzt_units={raw_xyzt_units})."
+        )
+    if (raw_xyzt_units & 0x07) != 2:
+        raise RuntimeError(
+            f"Saved NIfTI raw spatial-unit code is {raw_xyzt_units & 0x07}, expected 2 (mm); "
+            f"combined xyzt_units={raw_xyzt_units}."
+        )
+    if not np.allclose(saved_zooms, expected_voxel_size_mm, rtol=1e-5, atol=1e-5):
+        raise RuntimeError(
+            f"Saved NIfTI pixdim/zooms {saved_zooms} do not match expected mm spacing "
+            f"{expected_voxel_size_mm}."
+        )
+    if not np.allclose(affine_zooms, expected_voxel_size_mm, rtol=1e-5, atol=1e-5):
+        raise RuntimeError(
+            f"Saved NIfTI affine spacing {affine_zooms} does not match expected mm spacing "
+            f"{expected_voxel_size_mm}."
+        )
+    if int(qform_code) == 0 or int(sform_code) == 0:
+        raise RuntimeError(
+            f"Saved NIfTI qform/sform codes must be nonzero; got qform={qform_code}, sform={sform_code}."
+        )
+    if not np.allclose(qform, saved.affine) or not np.allclose(sform, saved.affine):
+        raise RuntimeError("Saved NIfTI qform/sform do not match the image affine.")
+
     sidecar = dict(metadata or {})
+    sidecar["NIfTIHeaderValidation"] = {
+        "Passed": True,
+        "RawXYZTUnitsCode": raw_xyzt_units,
+        "SpatialUnit": spatial_unit,
+        "TemporalUnit": temporal_unit,
+        "HeaderVoxelSizeMm": list(saved_zooms),
+        "AffineVoxelSizeMm": list(affine_zooms),
+        "QFormCode": int(qform_code),
+        "SFormCode": int(sform_code),
+        "OrientationCodes": list(nib.aff2axcodes(saved.affine)),
+    }
     with open(json_path, "w") as f:
         json.dump(sidecar, f, indent=2)
 
     print(f"Saved NIfTI: {nii_path}")
     print(f"Saved JSON:  {json_path}")
-    print(f"Saved shape: {img.shape}")
-    print(f"Saved voxel size: {voxel_size_mm}")
-    print(f"Saved orientation: {nib.aff2axcodes(img.affine)}")
+    print(f"Saved shape: {saved.shape}")
+    print(f"Saved spatial unit: {spatial_unit} (raw xyzt_units={raw_xyzt_units})")
+    print(f"Saved header voxel size: {saved_zooms} mm")
+    print(f"Saved affine voxel size: {affine_zooms} mm")
+    print(f"Saved orientation: {nib.aff2axcodes(saved.affine)}")
     return nii_path, json_path
-
 
 def print_twix_orientation_summary(affine: np.ndarray, twix_info: Mapping[str, Any]) -> None:
     """Print a compact Twix-derived affine/orientation summary."""
