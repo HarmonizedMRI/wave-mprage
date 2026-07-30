@@ -153,6 +153,7 @@ def main():
         os_factor=os_factor,
         voxel_size_mm=nifti_voxel_size_mm,
         twix_array_axis_roles=nifti_axis_roles,
+        twix_array_axis_flips=nifti_axis_flips,
         twix_coord_system=twix_coord_system,
         twix_inplane_rot_sign=twix_inplane_rot_sign,
     )
@@ -1224,10 +1225,18 @@ def _process_psf_coefficients(
     outputs = []
     diagnostics = {}
     for name, raw in (("a", a_raw), ("b", b_raw), ("c", c_raw)):
-        raw_1d = _squeeze_fit_vector(raw, name=f"{name}_raw")
+        # Keep this branch tensor-native so dtype/device information remains
+        # available when the full fitted curve is converted back to PyTorch.
+        raw_1d = torch.as_tensor(raw).detach().squeeze()
+        if raw_1d.ndim != 1:
+            raise ValueError(
+                f"{name}_raw should reduce to a 1D vector after squeeze; "
+                f"got shape {tuple(raw_1d.shape)}"
+            )
+
         params = _fit_sine_plus_line(
             kx_fit,
-            raw_1d[fit_kx_min:fit_kx_max].detach().cpu().numpy(),
+            raw_1d[fit_kx_min:fit_kx_max].cpu().numpy(),
         )
         fitted = _sine_line_model(
             kx_all,
