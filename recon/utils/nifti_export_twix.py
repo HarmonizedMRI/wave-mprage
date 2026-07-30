@@ -493,8 +493,60 @@ def save_nifti_with_json(
         raise RuntimeError(
             f"Saved NIfTI qform/sform codes must be nonzero; got qform={qform_code}, sform={sform_code}."
         )
-    if not np.allclose(qform, saved.affine) or not np.allclose(sform, saved.affine):
-        raise RuntimeError("Saved NIfTI qform/sform do not match the image affine.")
+    # The sform stores the authoritative full affine. NIfTI-1 stores its
+    # matrix elements as float32, so allow normal header round-off.
+    sform_max_abs_error = float(np.max(np.abs(sform - saved.affine)))
+    if not np.allclose(
+        sform,
+        saved.affine,
+        rtol=1e-5,
+        atol=1e-4,
+    ):
+        raise RuntimeError(
+            "Saved NIfTI sform does not match the image affine. "
+            f"Maximum absolute difference: {sform_max_abs_error:.6g} mm."
+        )
+
+    # qform uses a quaternion representation and cannot encode arbitrary
+    # shear exactly. Validate its clinically relevant properties instead
+    # of requiring element-by-element equality with the full sform affine.
+    qform_voxel_size_mm = tuple(
+        float(v) for v in nib.affines.voxel_sizes(qform)
+    )
+    qform_orientation = tuple(nib.aff2axcodes(qform))
+    saved_orientation = tuple(nib.aff2axcodes(saved.affine))
+    qform_max_abs_error = float(np.max(np.abs(qform - saved.affine)))
+
+    if not np.allclose(
+        qform_voxel_size_mm,
+        expected_voxel_size_mm,
+        rtol=1e-5,
+        atol=1e-4,
+    ):
+        raise RuntimeError(
+            "Saved NIfTI qform voxel sizes do not match the expected spacing. "
+            f"qform={qform_voxel_size_mm}, "
+            f"expected={expected_voxel_size_mm}."
+        )
+
+    if qform_orientation != saved_orientation:
+        raise RuntimeError(
+            "Saved NIfTI qform orientation does not match the sform affine. "
+            f"qform={qform_orientation}, "
+            f"sform={saved_orientation}."
+        )
+
+    if not np.allclose(
+        qform,
+        saved.affine,
+        rtol=1e-5,
+        atol=1e-4,
+    ):
+        print(
+            "NIfTI note: qform is an approximate quaternion representation "
+            "of the full sform affine "
+            f"(maximum element difference={qform_max_abs_error:.6g} mm)."
+        )
 
     sidecar = dict(metadata or {})
     sidecar["NIfTIHeaderValidation"] = {
@@ -507,6 +559,10 @@ def save_nifti_with_json(
         "QFormCode": int(qform_code),
         "SFormCode": int(sform_code),
         "OrientationCodes": list(nib.aff2axcodes(saved.affine)),
+        "SFormMaxAbsDifferenceMm": sform_max_abs_error,
+        "QFormMaxAbsDifferenceMm": qform_max_abs_error,
+        "QFormVoxelSizeMm": list(qform_voxel_size_mm),
+        "QFormOrientationCodes": list(qform_orientation),
     }
     with open(json_path, "w") as f:
         json.dump(sidecar, f, indent=2)
