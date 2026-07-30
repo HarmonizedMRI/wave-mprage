@@ -108,6 +108,57 @@ The old `--data-folder` argument is not part of the direct-path interface. Suppl
 10. Run wave or no-wave CG-SENSE on CPU.
 11. Save `.npy` arrays, diagnostic plots, and optional NIfTI outputs.
 
+## PSF coefficient processing
+
+For wave reconstruction, the projection calibration first estimates the readout-dependent phase-plane coefficients `a(kx)`, `b(kx)`, and `c(kx)`. The final coefficient-processing method is selected with:
+
+```text
+--psf-coefficient-processing smooth      default
+--psf-coefficient-processing sine-line
+```
+
+### `smooth`
+
+The default path applies NaN-aware one-dimensional smoothing to the directly estimated coefficients. This preserves the established reconstruction behavior and should be used for routine data when the fitted coefficient curves remain stable across readout.
+
+### `sine-line`
+
+The optional path fits each coefficient within a user-selected high-fidelity readout interval to:
+
+```text
+A * sin(w * kx + phi) + C1 * kx + C2
+```
+
+The fitted model is then evaluated over the complete oversampled readout. In this mode, the sine-plus-line model **replaces** the normal smoothing step; the fitted curves are not smoothed again.
+
+Use this option when the direct PSF coefficient fit is reliable over a central or otherwise trusted region but blows up, becomes discontinuous, or is contaminated outside that region. Both range arguments are required:
+
+```text
+--psf-fit-kx-min INTEGER
+--psf-fit-kx-max INTEGER
+```
+
+The selected interval follows the half-open Python convention `[kx_min, kx_max)` and must satisfy:
+
+```text
+0 <= kx_min < kx_max <= Nx_os
+```
+
+Example:
+
+```bash
+uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
+  --twix /path/to/data/meas_integrated_wave_mprage.dat \
+  --seq /path/to/data/mprage_3d_flashcalib_wave.seq \
+  --out /path/to/output \
+  --wave-mode wave \
+  --psf-coefficient-processing sine-line \
+  --psf-fit-kx-min 200 \
+  --psf-fit-kx-max 512
+```
+
+Choose the high-fidelity interval from the saved coefficient and PSF diagnostic plots. It should exclude visibly corrupted readout regions while retaining enough finite samples and oscillatory structure for a stable fit. The script reports an error when `sine-line` is selected without both bounds.
+
 ## CPU and GPU behavior
 
 The current implementation does not move the full reconstruction to GPU.
@@ -134,6 +185,8 @@ This `auto` setting is independent of `--wave-mode auto`:
 - `--espirit-device auto` selects CPU or GPU for ESPIRiT calibration.
 
 ESPIRiT device auto-selection catches missing CuPy, CUDA initialization failures, and an unavailable requested GPU index, then reports the reason and uses CPU. Explicit `gpu` mode raises an error for those conditions.
+
+For acquisitions with more than 32 receive channels, consider `--espirit-device cpu` when CPU memory and runtime are more suitable than the available GPU resources, or when GPU ESPIRiT is unstable. The ESPIRiT input is coil-compressed, but high-channel-count acquisitions still increase TWIX loading and coil-compression preparation demands.
 
 CuPy is therefore optional for CPU reconstruction. Install the `gpu` dependency group only on a CUDA 12 system where GPU-assisted ESPIRiT is desired.
 
@@ -201,7 +254,7 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
 --reuse-coil-calib
 ```
 
-This reuses `coil_compression_energy_<tag>.npy` and `csm_full_<tag>.npy` when both exist. Use cached files only when the acquisition geometry, coil configuration, ACS data, and reconstruction dimensions match.
+This reuses `coil_compression_energy_<tag>.npy` and `csm_full_<tag>.npy` when both exist. It is useful when ESPIRiT completed successfully but reconstruction failed later: rerun with the same output directory and `--file-tag`, then add `--reuse-coil-calib` to avoid repeating coil compression and sensitivity-map estimation. Use cached files only when the TWIX measurement, acquisition geometry, coil configuration, ACS data, and reconstruction dimensions match. The supported option name is `--reuse-coil-calib`.
 
 ## Sagittal logical-axis convention
 
@@ -243,8 +296,8 @@ Important defaults:
 
 ```text
 output folder:        <out>/nifti/
-axis roles:           readout,phase,slice
-axis flips:           false,true,false
+axis roles:           phase,readout,slice
+axis flips:           true,false,false
 Twix coordinate mode: LPS
 in-plane rotation:    sign -1.0
 ```

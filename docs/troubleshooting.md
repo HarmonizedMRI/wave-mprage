@@ -60,6 +60,52 @@ both sine and cosine wave axes inactive -> nowave
 
 Sine-only and cosine-only MPRAGE imaging trajectories are rejected because the reconstruction does not provide a validated one-axis wave path. Regenerate the sequence with both wave axes enabled or both disabled.
 
+## PSF coefficient curves blow up
+
+Inspect the saved `a(kx)`, `b(kx)`, `c(kx)`, `psf_real`, and `psf_theory` diagnostics. When the direct coefficient fit is trustworthy only within a limited readout region and becomes unstable outside it, rerun with the sine-plus-line coefficient model:
+
+```bash
+uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
+  --twix /path/to/data/scan.dat \
+  --seq /path/to/data/scan.seq \
+  --out /path/to/output \
+  --wave-mode wave \
+  --psf-coefficient-processing sine-line \
+  --psf-fit-kx-min 200 \
+  --psf-fit-kx-max 512
+```
+
+Replace the example bounds with a high-fidelity interval identified from your calibration diagnostics. The interval is `[kx_min, kx_max)`. Both bounds are mandatory in `sine-line` mode.
+
+The sine-plus-line model is intended as a controlled substitution for the default `smooth` processing. It fits `A*sin(w*kx+phi) + C1*kx + C2` over the trusted interval, evaluates the model across the full readout, and does not apply the normal smoothing afterward. It cannot recover calibration information when the selected interval itself is aliased or contaminated.
+
+## Reconstruction failed after ESPIRiT completed
+
+When the coil-compression matrix and full-resolution ESPIRiT sensitivity maps were saved before a later failure, rerun the same acquisition with:
+
+```text
+--reuse-coil-calib
+```
+
+Use the same `--out` directory and the same `--file-tag` so the script finds:
+
+```text
+coil_compression_energy_<tag>.npy
+csm_full_<tag>.npy
+```
+
+The supported option is `--reuse-coil-calib` rather than `--reuse-exist-calib`. Reuse these files only when the TWIX measurement, receive-coil selection, geometry, ACS dimensions, oversampling, and reconstruction dimensions are unchanged. If any of those differ, rerun without the reuse option.
+
+## Residual wave aliasing or contaminated PSF calibration
+
+Some failures originate in the scan prescription and cannot be fully corrected during reconstruction:
+
+- Turn off neck-coil elements to reduce neck and shoulder signal entering the projection calibration.
+- Prescribe the FOV box to cover the entire signal-producing volume relevant to the scan. Signal originating outside the encoded FOV can wrap into the acquisition, and wave-induced aliasing from that unencoded volume cannot be fully resolved.
+- Confirm that the matching `.seq` file and sagittal protocol were used.
+
+When out-of-FOV signal contaminates only part of the fitted coefficient curves, the optional `sine-line` model may help if a clearly high-fidelity interval remains. It is not a replacement for an adequate FOV or appropriate receive-coil selection.
+
 ## `pip install --group` is not recognized
 
 Dependency groups require pip 25.1 or newer:
@@ -130,7 +176,7 @@ uv sync --locked --group gpu
 
 ## CPU ESPIRiT is slow
 
-CPU fallback prioritizes portability rather than speed. The input is already coil-compressed and spatially reduced before ESPIRiT, but a CPU run can still take substantially longer than GPU calibration. Reuse validated cached calibration files with `--reuse-coil-calib` when appropriate.
+CPU fallback prioritizes portability rather than speed. The input is already coil-compressed and spatially reduced before ESPIRiT, but a CPU run can still take substantially longer than GPU calibration. For acquisitions with more than 32 receive channels, CPU ESPIRiT may nevertheless be preferable when the available CPU memory is more suitable than GPU memory or when GPU execution is unstable. Select it explicitly with `--espirit-device cpu`. Reuse validated cached calibration files with `--reuse-coil-calib` when appropriate.
 
 ## CUDA, CuPy, and driver mismatch
 
@@ -195,7 +241,7 @@ Compare against a trusted DICOM/NIfTI reference and adjust:
 --twix-coord-system
 ```
 
-The current defaults are `false,true,false`, rotation sign `-1`, and `LPS`.
+The current MPRAGE defaults are axis roles `phase,readout,slice`, axis flips `true,false,false`, rotation sign `-1`, and `LPS`.
 
 ## MATLAB cannot find Pulseq
 

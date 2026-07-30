@@ -60,6 +60,16 @@ Depending on `write_v141_format`, outputs are written to one or both folders:
 
 These generated folders are ignored by Git.
 
+## Scanner protocol UI recommendations
+
+Apply the following receive-coil and geometry settings when prescribing the scan:
+
+- Turn off the neck-coil elements for this protocol. Signal from the neck or shoulders can enter the projection calibration and contaminate the measured wave PSF, particularly when that anatomy aliases into the encoded FOV.
+- Position and size the FOV box so that it covers the entire signal-producing volume relevant to the acquisition. Signal originating outside the encoded FOV may wrap into the image, and wave-induced aliasing from that unencoded volume cannot be fully resolved by the reconstruction.
+- Confirm the sagittal prescription and the intended FOV before starting the scan. The current sequence and reconstruction are validated for the hard-coded `SAG` mapping described below.
+
+These settings should be checked in the scanner protocol UI for every subject rather than assumed from a saved protocol.
+
 ## Acquisition order
 
 The integrated sequence contains:
@@ -82,7 +92,7 @@ ax.d2 = 'x';  % inner PE / PAR
 ax.d3 = 'y';  % outer PE / LIN
 ```
 
-The reconstruction code mirrors this logical-axis mapping because the `ax` structure itself is not stored in the Pulseq definitions.
+The reconstruction code mirrors and asserts this logical-axis mapping.
 
 ## TWIX routing
 

@@ -60,7 +60,7 @@ The current execution model is:
 | ESPIRiT sensitivity-map calibration | GPU when available, otherwise CPU |
 | Wave/no-wave CG-SENSE | CPU |
 
-A GPU is therefore optional. `--espirit-device auto` uses a compatible GPU when CuPy can access one and otherwise falls back to CPU.
+A GPU is therefore optional. `--espirit-device auto` uses a compatible GPU when CuPy can access one and otherwise falls back to CPU. For acquisitions with more than 32 receive channels, consider `--espirit-device cpu` when the available CPU memory is more suitable than the GPU resources or when GPU calibration is unstable.
 
 ## Clone
 
@@ -132,6 +132,8 @@ generated_seq_v151/
 
 See [Sequence generation](docs/sequence.md) for acquisition order, TWIX routing, calibration SET layout, path handling, and validation.
 
+Before scanning, turn off the neck-coil elements and prescribe an FOV that covers the complete signal-producing volume. Out-of-FOV neck or shoulder signal can contaminate the projection calibration, and wave-induced aliasing from anatomy outside the encoded FOV cannot be fully resolved.
+
 ## Reconstruct an integrated acquisition
 
 The integrated measurement is expected to contain:
@@ -196,7 +198,7 @@ The following compatibility aliases remain accepted:
 
 The old shared `--data-folder` argument is no longer needed because `--twix` and `--seq` accept direct absolute or relative paths.
 
-See [Reconstruction](docs/reconstruction.md) for the pipeline, input assumptions, complete command-line interface, device behavior, output files, and NIfTI conventions.
+See [Reconstruction](docs/reconstruction.md) for the pipeline, input assumptions, complete command-line interface, device behavior, output files, and NIfTI conventions. The reconstruction guide also documents the optional `smooth` and `sine-line` PSF coefficient-processing modes; troubleshooting guidance explains when to use the sine-line model and how to reuse an existing coil calibration after a downstream failure.
 
 ## Documentation
 
