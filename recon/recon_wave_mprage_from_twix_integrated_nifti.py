@@ -85,6 +85,7 @@ def main():
     reuse_coil_calib = cfg["reuse_coil_calib"]
     espirit_device = cfg["espirit_device"]
     espirit_gpu_index = cfg["espirit_gpu_index"]
+    espirit_crop = cfg["espirit_crop"]
     yflip = cfg["yflip"]
     zflip = cfg["zflip"]
     save_nifti = cfg["save_nifti"]
@@ -171,6 +172,7 @@ def main():
         reuse_coil_calib=reuse_coil_calib,
         espirit_device=espirit_device,
         espirit_gpu_index=espirit_gpu_index,
+        espirit_crop=espirit_crop,
     )
     if Ncoil_ref != Ncoil:
         raise ValueError(
@@ -729,6 +731,7 @@ def load_or_generate_coil_sens(
     reuse_coil_calib=False,
     espirit_device="auto",
     espirit_gpu_index=0,
+    espirit_crop=0.8,
 ):
     """Load cached Wcc/CSM or generate them from the integrated ACS refscan set."""
     wcc_file = _npy_output_path(out_folder + 'coil_compression_energy_' + file_tag)
@@ -736,6 +739,10 @@ def load_or_generate_coil_sens(
 
     if reuse_coil_calib and os.path.isfile(wcc_file) and os.path.isfile(csm_file):
         print("Reusing existing coil compression matrix and coil sensitivity maps.")
+        print(
+            f"ESPIRiT crop threshold {espirit_crop:g} is not reapplied "
+            "because cached sensitivity maps are being reused."
+        )
         print(f"Loading Wcc from: {wcc_file}")
         Wcc = np.load(wcc_file)
         print(f"Loading CSM from: {csm_file}")
@@ -758,6 +765,7 @@ def load_or_generate_coil_sens(
         Nacs=Nacs,
         espirit_device=espirit_device,
         espirit_gpu_index=espirit_gpu_index,
+        espirit_crop=espirit_crop,
     )
 
 
@@ -771,8 +779,14 @@ def generate_coil_sens(
     Nacs=32,
     espirit_device="auto",
     espirit_gpu_index=0,
+    espirit_crop=0.8,
 ):
     """Generate Wcc and ESPIRiT CSMs from the integrated sequence ACS refscan."""
+    espirit_crop = float(espirit_crop)
+    if not np.isfinite(espirit_crop) or not 0.0 <= espirit_crop <= 1.0:
+        raise ValueError("espirit_crop must be a finite value between 0 and 1.")
+
+    print(f"ESPIRiT crop threshold: {espirit_crop:g}")
     device, using_gpu = _select_espirit_device(
         mode=espirit_device,
         gpu_index=espirit_gpu_index,
@@ -826,7 +840,7 @@ def generate_coil_sens(
         kspace_low_cc_sp,
         calib_width=24,
         device=device,
-        crop=0.8,
+        crop=espirit_crop,
         show_pbar=True,
     ).run()
 
@@ -1426,6 +1440,15 @@ def _parse_cli_args():
         default=None,
         help="CUDA device index used when ESPIRiT selects a GPU. Default: 0.",
     )
+    parser.add_argument(
+        "--espirit-crop",
+        type=float,
+        default=None,
+        help=(
+            "ESPIRiT eigenvalue crop threshold. Lower values generally retain "
+            "a larger sensitivity-map support region. Default: 0.8."
+        ),
+    )
     parser.add_argument("--yflip", type=int, default=None,
                         help="Sign convention for y wave PSF calibration. Default: -1.")
     parser.add_argument("--zflip", type=int, default=None,
@@ -1624,6 +1647,14 @@ def _collect_runtime_config():
     if espirit_gpu_index_value < 0:
         raise ValueError("espirit_gpu_index must be a non-negative integer.")
 
+    if cli.espirit_crop is not None:
+        espirit_crop_value = float(cli.espirit_crop)
+    else:
+        espirit_crop_value = float(globals().get("espirit_crop", 0.8))
+
+    if not np.isfinite(espirit_crop_value) or not 0.0 <= espirit_crop_value <= 1.0:
+        raise ValueError("--espirit-crop must be a finite value between 0 and 1.")
+
     yflip_value = _get_optional_int("yflip", cli.yflip, default=-1, allowed_values=(-1, 1))
     zflip_value = _get_optional_int("zflip", cli.zflip, default=-1, allowed_values=(-1, 1))
 
@@ -1708,6 +1739,7 @@ def _collect_runtime_config():
     print(f"  reuse_coil_calib:  {reuse_coil_calib_value}")
     print("  coil compression: CPU")
     print(f"  ESPIRiT request:  {espirit_device_value} (GPU index {espirit_gpu_index_value})")
+    print(f"  ESPIRiT crop:     {espirit_crop_value:g}")
     print("  CG-SENSE:         CPU")
     print(f"  yflip/zflip:       {yflip_value}/{zflip_value}")
     print(f"  save_nifti:        {save_nifti_value}")
@@ -1730,6 +1762,7 @@ def _collect_runtime_config():
         "reuse_coil_calib": reuse_coil_calib_value,
         "espirit_device": espirit_device_value,
         "espirit_gpu_index": espirit_gpu_index_value,
+        "espirit_crop": espirit_crop_value,
         "yflip": yflip_value,
         "zflip": zflip_value,
         "save_nifti": save_nifti_value,
