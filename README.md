@@ -57,10 +57,10 @@ The current execution model is:
 | Step | Device |
 |---|---|
 | Coil-compression matrix estimation and application | CPU |
-| ESPIRiT sensitivity-map calibration | GPU when available, otherwise CPU |
+| ESPIRiT sensitivity-map calibration | Native 3D on CPU/GPU, or optional CPU-parallel `slice2d` |
 | Wave/no-wave CG-SENSE | CPU |
 
-A GPU is therefore optional. `--espirit-device auto` uses a compatible GPU when CuPy can access one and otherwise falls back to CPU. For acquisitions with more than 32 receive channels, consider `--espirit-device cpu` when the available CPU memory is more suitable than the GPU resources or when GPU calibration is unstable.
+A GPU is optional. The default `--espirit-calib-mode 3d` uses the native joint 3D SigPy calibration; `--espirit-device auto` uses a compatible GPU when CuPy can access one and otherwise falls back to CPU. The optional `--espirit-calib-mode slice2d` backend is CPU-only and parallelizes independent hybrid-space 2D calibrations across logical readout positions. For acquisitions with more than 32 receive channels, consider CPU calibration when the available CPU memory is more suitable than the GPU resources or when GPU calibration is unstable.
 
 ## Clone
 
@@ -187,6 +187,40 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
 
 Use `--espirit-device gpu --espirit-gpu-index 0` to require a specific GPU. The script raises a clear error instead of silently falling back when GPU mode is explicitly requested.
 
+### ESPIRiT calibration mode, crop, and CPU workers
+
+The calibration backend is selected independently of the Wave-MPRAGE forward model:
+
+| Argument | Behavior |
+|---|---|
+| `--espirit-calib-mode 3d` | Native joint 3D SigPy ESPIRiT; default and reference mode; CPU or GPU |
+| `--espirit-calib-mode slice2d` | CPU-parallel 2D ESPIRiT over logical-RO hybrid-space slices |
+
+The `slice2d` backend receives the logical low-resolution ACS after the existing readout-oversampling removal. It inverse-transforms logical RO and calibrates each joint LIN-PAR plane independently, preserving both accelerated phase-encoding dimensions within every 2D calibration.
+
+A practical CPU-parallel example is:
+
+```bash
+uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
+  --twix /path/to/data/meas_integrated_wave_mprage.dat \
+  --seq /path/to/data/mprage_3d_flashcalib_wave.seq \
+  --out /path/to/output \
+  --wave-mode auto \
+  --espirit-device cpu \
+  --espirit-calib-mode slice2d \
+  --espirit-crop 0.8
+```
+
+`--espirit-crop` is valid for both calibration modes. Testing with the current Wave-MPRAGE implementation found `0.8–0.9` to be a reasonable practical range: `0.8` retains somewhat broader low-SNR support, while `0.9` applies a stricter support mask. Inspect the saved CSM magnitude and phase plots for each acquisition.
+
+When `--espirit-cpu-workers` is omitted, `slice2d` automatically uses the available physical-core count, capped by the number of logical-RO slices. Set it explicitly when sharing a machine, limiting memory use, or benchmarking, for example:
+
+```text
+--espirit-cpu-workers 16
+```
+
+See [Troubleshooting](docs/troubleshooting.md) for Linux CPU inspection with `lscpu`, worker-count guidance, and crop-related checks.
+
 The following compatibility aliases remain accepted:
 
 | Preferred argument | Compatibility aliases |
@@ -198,7 +232,7 @@ The following compatibility aliases remain accepted:
 
 The old shared `--data-folder` argument is no longer needed because `--twix` and `--seq` accept direct absolute or relative paths.
 
-See [Reconstruction](docs/reconstruction.md) for the pipeline, input assumptions, complete command-line interface, device behavior, output files, and NIfTI conventions. The reconstruction guide also documents the optional `smooth` and `sine-line` PSF coefficient-processing modes; troubleshooting guidance explains when to use the sine-line model and how to reuse an existing coil calibration after a downstream failure.
+See [Reconstruction](docs/reconstruction.md) for the pipeline, ESPIRiT calibration modes, crop and CPU-worker behavior, input assumptions, complete command-line interface, output files, and NIfTI conventions. The reconstruction guide also documents the optional `smooth` and `sine-line` PSF coefficient-processing modes; troubleshooting guidance explains CPU sizing with `lscpu`, crop/support checks, sine-line use, and safe reuse of an existing mode-specific coil calibration.
 
 ## Documentation
 

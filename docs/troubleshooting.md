@@ -87,14 +87,15 @@ When the coil-compression matrix and full-resolution ESPIRiT sensitivity maps we
 --reuse-coil-calib
 ```
 
-Use the same `--out` directory and the same `--file-tag` so the script finds:
+Use the same `--out` directory, `--file-tag`, and `--espirit-calib-mode`. The script uses:
 
 ```text
 coil_compression_energy_<tag>.npy
-csm_full_<tag>.npy
+csm_full_<tag>.npy                 # 3d
+csm_full_slice2d_<tag>.npy         # slice2d
 ```
 
-The supported option is `--reuse-coil-calib` rather than `--reuse-exist-calib`. Reuse these files only when the TWIX measurement, receive-coil selection, geometry, ACS dimensions, oversampling, and reconstruction dimensions are unchanged. If any of those differ, rerun without the reuse option.
+The supported option is `--reuse-coil-calib` rather than `--reuse-exist-calib`. Reuse these files only when the TWIX measurement, receive-coil selection, geometry, ACS dimensions, oversampling, compression settings, reconstruction dimensions, calibration mode, and intended crop value are unchanged. A newly supplied `--espirit-crop` value is not reapplied to an existing cached map. If any relevant setting differs, rerun without the reuse option.
 
 ## Residual wave aliasing or contaminated PSF calibration
 
@@ -176,7 +177,100 @@ uv sync --locked --group gpu
 
 ## CPU ESPIRiT is slow
 
-CPU fallback prioritizes portability rather than speed. The input is already coil-compressed and spatially reduced before ESPIRiT, but a CPU run can still take substantially longer than GPU calibration. For acquisitions with more than 32 receive channels, CPU ESPIRiT may nevertheless be preferable when the available CPU memory is more suitable than GPU memory or when GPU execution is unstable. Select it explicitly with `--espirit-device cpu`. Reuse validated cached calibration files with `--reuse-coil-calib` when appropriate.
+The default `--espirit-calib-mode 3d` performs one joint 3D SigPy calibration. On CPU this can remain slow even though the input has already been coil-compressed and spatially reduced.
+
+When native 3D CPU ESPIRiT is the bottleneck, try the optional CPU-parallel backend:
+
+```bash
+uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
+  --twix /path/to/data/scan.dat \
+  --seq /path/to/data/scan.seq \
+  --out /path/to/output \
+  --wave-mode auto \
+  --espirit-device cpu \
+  --espirit-calib-mode slice2d \
+  --espirit-crop 0.8
+```
+
+The implementation removes readout oversampling before transforming logical RO to hybrid space. Do not apply the slice-wise method directly to the raw fourfold-oversampled RO array.
+
+Native 3D remains the reference estimator. Compare representative 3D and slice2d results before adopting slice2d routinely. Reuse validated mode-specific calibration files with `--reuse-coil-calib` when appropriate.
+
+## Choose the slice2d CPU-worker count on Linux
+
+Inspect the machine topology with:
+
+```bash
+lscpu
+```
+
+Important fields include:
+
+```text
+CPU(s)               logical CPUs visible to the system
+Thread(s) per core   hardware threads per physical core
+Core(s) per socket   physical cores per socket
+Socket(s)            CPU sockets
+```
+
+Also check the CPUs available to the current process or job:
+
+```bash
+nproc
+grep Cpus_allowed_list /proc/self/status
+```
+
+On a scheduler-managed system, use the CPUs allocated to the job rather than the full node count. `lscpu` reports topology; it does not guarantee that every listed CPU is available to your process or currently idle.
+
+When `--espirit-cpu-workers` is omitted, joblib selects the available physical-core count and the implementation caps it by the number of logical-RO slices. This automatic value is a reasonable first choice on a dedicated machine. On a shared node or when memory bandwidth is limiting, set a lower value explicitly and benchmark, for example:
+
+```text
+--espirit-cpu-workers 8
+--espirit-cpu-workers 16
+--espirit-cpu-workers 24
+```
+
+Do not assume that using every logical CPU is fastest. Each worker performs an SVD and uses memory bandwidth; excessive workers can increase process overhead and RAM pressure. Increase the worker count only while runtime continues to improve meaningfully.
+
+## Slice2d is slow or uses too much memory
+
+Try the following:
+
+- reduce `--espirit-cpu-workers`;
+- confirm the runtime summary reports `ESPIRiT mode: slice2d` and the expected worker count;
+- avoid running several reconstructions concurrently on the same node;
+- check available memory and CPU load before launching the calibration;
+- compare a small set of worker counts rather than immediately using all logical CPUs.
+
+Worker count changes execution only and should not materially change the maps. Crop and calibration mode do change the estimator or support and require separate validation.
+
+## Slice2d rejects GPU mode
+
+`slice2d` is intentionally CPU-only. This combination is invalid:
+
+```text
+--espirit-calib-mode slice2d --espirit-device gpu
+```
+
+Use one of:
+
+```text
+--espirit-calib-mode slice2d --espirit-device cpu
+--espirit-calib-mode slice2d --espirit-device auto
+--espirit-calib-mode 3d --espirit-device gpu
+```
+
+## ESPIRiT crop removes low-SNR anatomy
+
+`--espirit-crop` remains active in both `3d` and `slice2d` modes. Higher values create a stricter support mask; lower values retain broader support. In slice2d mode the threshold is applied independently to each logical-RO plane.
+
+Testing with the current Wave-MPRAGE implementation found `0.8–0.9` to be a reasonable practical range:
+
+- use `0.8` as the first choice when low-SNR anterior anatomy is being removed;
+- use `0.9` when the broader support from `0.8` includes too much unreliable background;
+- inspect both CSM magnitude and phase plots and the final reconstruction.
+
+Recompute the maps after changing crop. Do not use `--reuse-coil-calib` for that comparison, because a cached CSM has already had its crop mask applied. If important anatomy remains absent at `0.8`, the limitation may come from the calibration subspace or local SNR rather than crop alone.
 
 ## CUDA, CuPy, and driver mismatch
 
@@ -218,18 +312,19 @@ Regenerate the sequence after adding or changing those definitions.
 
 ## Cached coil calibration has the wrong dimensions
 
-Delete or disable the cached files when geometry, readout oversampling, ACS size, receive coils, or compression settings have changed:
+Delete or disable the cached files when geometry, readout oversampling, ACS size, receive coils, compression settings, ESPIRiT mode, or the intended crop value has changed:
 
 ```text
 coil_compression_energy_<tag>.npy
-csm_full_<tag>.npy
+csm_full_<tag>.npy                 # 3d
+csm_full_slice2d_<tag>.npy         # slice2d
 ```
 
 Then rerun without `--reuse-coil-calib`.
 
 ## Memory errors
 
-The full CG-SENSE reconstruction is CPU-based and can require substantial RAM. Reduce concurrent jobs, close other large processes, or run on a node with more memory. The GPU memory requirement is limited mainly to the reduced ESPIRiT problem.
+The full CG-SENSE reconstruction is CPU-based and can require substantial RAM. Reduce concurrent jobs, close other large processes, or run on a node with more memory. For `slice2d` ESPIRiT, also reduce `--espirit-cpu-workers` because multiple worker processes run calibrations concurrently. The GPU memory requirement is limited mainly to the reduced native 3D ESPIRiT problem.
 
 ## NIfTI is mirrored or rotated
 

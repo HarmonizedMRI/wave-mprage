@@ -102,7 +102,7 @@ The old `--data-folder` argument is not part of the direct-path interface. Suppl
 4. Load the integrated ACS block from the final `refscan` SET.
 5. Estimate a 32-to-12 coil-compression matrix on CPU.
 6. Apply coil compression on CPU.
-7. Estimate low-resolution ESPIRiT maps on the selected SigPy device.
+7. Estimate low-resolution ESPIRiT maps with the selected `3d` or `slice2d` calibration backend.
 8. Interpolate and normalize the sensitivity maps.
 9. For wave data, fit the FLASH projection phase deviation and construct the calibrated wave PSF.
 10. Run wave or no-wave CG-SENSE on CPU.
@@ -167,8 +167,48 @@ The current implementation does not move the full reconstruction to GPU.
 |---|---|
 | Coil-compression estimation | CPU / NumPy and SciPy |
 | Coil-compression application | CPU / PyTorch tensor |
-| ESPIRiT calibration | selectable SigPy CPU or GPU |
+| Native `3d` ESPIRiT calibration | selectable SigPy CPU or GPU |
+| Parallel `slice2d` ESPIRiT calibration | CPU process workers |
 | Wave and no-wave CG-SENSE | CPU / PyTorch tensor |
+
+### ESPIRiT calibration mode
+
+```text
+--espirit-calib-mode 3d       default; native joint 3D SigPy ESPIRiT
+--espirit-calib-mode slice2d  CPU-parallel hybrid-space 2D ESPIRiT
+```
+
+`3d` remains the reference mode. It estimates one joint 3D calibration and can use either CPU or GPU.
+
+`slice2d` is an optional CPU-only acceleration path. The reconstruction first performs its existing readout-oversampling removal and coil compression, yielding logical k-space ordered as `(coil, RO, LIN, PAR)`. It then inverse-transforms logical RO and runs independent 2D ESPIRiT calibrations over the joint LIN-PAR plane. This preserves calibration coupling across both accelerated phase-encoding dimensions while removing coupling only along the fully sampled readout direction.
+
+Because `slice2d` estimates logical-RO positions independently, it is not mathematically identical to joint 3D ESPIRiT. Validate representative datasets by comparing CSM support, magnitude and phase continuity along logical RO, low-SNR anterior anatomy, final reconstruction differences, runtime, and peak memory.
+
+### ESPIRiT crop threshold
+
+```text
+--espirit-crop FLOAT  eigenvalue support threshold; default 0.8
+```
+
+The crop threshold is passed directly to SigPy in both `3d` and `slice2d` modes. Higher values apply a stricter support mask and set more low-eigenvalue locations to zero; lower values retain broader support. In `slice2d`, the crop is applied independently within each logical-RO plane.
+
+Testing with the current Wave-MPRAGE implementation found `0.8–0.9` to be a reasonable practical range:
+
+- start with `0.8` when preserving low-SNR anatomy and broader map support is important;
+- use `0.9` when a somewhat stricter, cleaner support mask is preferred;
+- inspect the saved CSM magnitude and phase plots rather than selecting the value from background suppression alone.
+
+Changing `--espirit-crop` requires recomputing sensitivity maps. When `--reuse-coil-calib` loads an existing CSM cache, the new crop value is not reapplied.
+
+### Slice2d CPU workers
+
+```text
+--espirit-cpu-workers N  process workers used only by slice2d
+```
+
+When this argument is omitted, joblib selects the available physical-core count and the implementation caps it by the number of logical-RO slices. Each worker calibrates one `(coil, LIN, PAR)` plane, and native BLAS threads are limited to one per worker to avoid nested oversubscription.
+
+Automatic worker selection is a useful first choice on a dedicated system. Set an explicit value when sharing a node, following a scheduler allocation, controlling RAM, or benchmarking. More workers are not always faster because the independent SVDs compete for memory bandwidth and create process overhead. See the troubleshooting guide for `lscpu`, `nproc`, CPU-affinity checks, and worker-count tuning.
 
 ### ESPIRiT device selection
 
@@ -186,9 +226,11 @@ This `auto` setting is independent of `--wave-mode auto`:
 
 ESPIRiT device auto-selection catches missing CuPy, CUDA initialization failures, and an unavailable requested GPU index, then reports the reason and uses CPU. Explicit `gpu` mode raises an error for those conditions.
 
-For acquisitions with more than 32 receive channels, consider `--espirit-device cpu` when CPU memory and runtime are more suitable than the available GPU resources, or when GPU ESPIRiT is unstable. The ESPIRiT input is coil-compressed, but high-channel-count acquisitions still increase TWIX loading and coil-compression preparation demands.
+Device selection applies directly to the native `3d` backend. The `slice2d` backend always runs on CPU: `--espirit-device cpu` and `--espirit-device auto` are accepted, while `--espirit-device gpu` with `--espirit-calib-mode slice2d` is rejected.
 
-CuPy is therefore optional for CPU reconstruction. Install the `gpu` dependency group only on a CUDA 12 system where GPU-assisted ESPIRiT is desired.
+For acquisitions with more than 32 receive channels, consider CPU calibration when CPU memory and runtime are more suitable than the available GPU resources, or when GPU ESPIRiT is unstable. The ESPIRiT input is coil-compressed, but high-channel-count acquisitions still increase TWIX loading and coil-compression preparation demands.
+
+CuPy is therefore optional for CPU reconstruction. Install the `gpu` dependency group only on a CUDA 12 system where GPU-assisted native 3D ESPIRiT is desired.
 
 ## Examples
 
@@ -213,6 +255,35 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
   --out /path/to/output \
   --wave-mode wave \
   --espirit-device cpu
+```
+
+### CPU-parallel slice2d ESPIRiT
+
+Let the implementation select the available physical-core count automatically:
+
+```bash
+uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
+  --twix /path/to/data/meas_integrated_wave_mprage.dat \
+  --seq /path/to/data/mprage_3d_flashcalib_wave.seq \
+  --out /path/to/output \
+  --wave-mode wave \
+  --espirit-device cpu \
+  --espirit-calib-mode slice2d \
+  --espirit-crop 0.8
+```
+
+Limit the run to a selected number of CPU workers:
+
+```bash
+uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
+  --twix /path/to/data/meas_integrated_wave_mprage.dat \
+  --seq /path/to/data/mprage_3d_flashcalib_wave.seq \
+  --out /path/to/output \
+  --wave-mode wave \
+  --espirit-device cpu \
+  --espirit-calib-mode slice2d \
+  --espirit-crop 0.9 \
+  --espirit-cpu-workers 16
 ```
 
 ### Explicit no-wave reconstruction
@@ -254,7 +325,18 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
 --reuse-coil-calib
 ```
 
-This reuses `coil_compression_energy_<tag>.npy` and `csm_full_<tag>.npy` when both exist. It is useful when ESPIRiT completed successfully but reconstruction failed later: rerun with the same output directory and `--file-tag`, then add `--reuse-coil-calib` to avoid repeating coil compression and sensitivity-map estimation. Use cached files only when the TWIX measurement, acquisition geometry, coil configuration, ACS data, and reconstruction dimensions match. The supported option name is `--reuse-coil-calib`.
+This reuses the coil-compression matrix and the CSM cache for the selected ESPIRiT calibration mode when both exist. It is useful when ESPIRiT completed successfully but reconstruction failed later: rerun with the same output directory, `--file-tag`, and `--espirit-calib-mode`, then add `--reuse-coil-calib`.
+
+For `--file-tag test01`, the full-resolution map names are:
+
+```text
+3d:       csm_full_test01.npy
+slice2d:  csm_full_slice2d_test01.npy
+```
+
+The mode-specific names prevent a `slice2d` run from silently reusing a 3D CSM, or vice versa. The coil-compression matrix remains shared because calibration mode does not change coil compression. Use cached files only when the TWIX measurement, acquisition geometry, coil configuration, ACS data, compression settings, reconstruction dimensions, ESPIRiT mode, and intended crop setting match. A different `--espirit-crop` value is not applied to a reused map.
+
+The supported option name is `--reuse-coil-calib`.
 
 ## Sagittal logical-axis convention
 
