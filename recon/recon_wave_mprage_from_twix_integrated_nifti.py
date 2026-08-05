@@ -56,6 +56,7 @@ from scipy.ndimage import zoom
 from utils.twix_import import *
 from utils.coil_compression_kspace import *
 from utils.plot_coil_sens import *
+from utils.espirit_calibration import estimate_espirit_maps
 
 from utils.psf_wrapped_phase_fit import fit_wrapped_phase_planes
 from utils.psf_wrapped_phase_fit import smooth_1d_nan
@@ -86,6 +87,8 @@ def main():
     espirit_device = cfg["espirit_device"]
     espirit_gpu_index = cfg["espirit_gpu_index"]
     espirit_crop = cfg["espirit_crop"]
+    espirit_calib_mode = cfg["espirit_calib_mode"]
+    espirit_cpu_workers = cfg["espirit_cpu_workers"]
     yflip = cfg["yflip"]
     zflip = cfg["zflip"]
     save_nifti = cfg["save_nifti"]
@@ -173,6 +176,8 @@ def main():
         espirit_device=espirit_device,
         espirit_gpu_index=espirit_gpu_index,
         espirit_crop=espirit_crop,
+        espirit_calib_mode=espirit_calib_mode,
+        espirit_cpu_workers=espirit_cpu_workers,
     )
     if Ncoil_ref != Ncoil:
         raise ValueError(
@@ -732,6 +737,8 @@ def load_or_generate_coil_sens(
     espirit_device="auto",
     espirit_gpu_index=0,
     espirit_crop=0.8,
+    espirit_calib_mode="3d",
+    espirit_cpu_workers=None,
 ):
     """Load cached Wcc/CSM or generate them from the integrated ACS refscan set."""
     wcc_file = _npy_output_path(out_folder + 'coil_compression_energy_' + file_tag)
@@ -766,6 +773,8 @@ def load_or_generate_coil_sens(
         espirit_device=espirit_device,
         espirit_gpu_index=espirit_gpu_index,
         espirit_crop=espirit_crop,
+        espirit_calib_mode=espirit_calib_mode,
+        espirit_cpu_workers=espirit_cpu_workers,
     )
 
 
@@ -780,17 +789,37 @@ def generate_coil_sens(
     espirit_device="auto",
     espirit_gpu_index=0,
     espirit_crop=0.8,
+    espirit_calib_mode="3d",
+    espirit_cpu_workers=None,
 ):
     """Generate Wcc and ESPIRiT CSMs from the integrated sequence ACS refscan."""
     espirit_crop = float(espirit_crop)
     if not np.isfinite(espirit_crop) or not 0.0 <= espirit_crop <= 1.0:
         raise ValueError("espirit_crop must be a finite value between 0 and 1.")
+    espirit_calib_mode = str(espirit_calib_mode).strip().lower()
+    if espirit_calib_mode not in ("3d", "slice2d"):
+        raise ValueError("espirit_calib_mode must be '3d' or 'slice2d'.")
+    csm_tag = _espirit_cache_tag(file_tag, espirit_calib_mode)
+    print(f"ESPIRiT calibration mode: {espirit_calib_mode}")
 
     print(f"ESPIRiT crop threshold: {espirit_crop:g}")
-    device, using_gpu = _select_espirit_device(
-        mode=espirit_device,
-        gpu_index=espirit_gpu_index,
-    )
+    if espirit_calib_mode == "slice2d":
+        if str(espirit_device).strip().lower() == "gpu":
+            raise ValueError(
+                "--espirit-calib-mode slice2d is CPU-only and cannot be used "
+                "with --espirit-device gpu."
+            )
+        print(
+            "slice2d ESPIRiT is CPU-only; logical readout oversampling is "
+            "removed before the hybrid-space transform."
+        )
+        device = sp.Device(-1)
+        using_gpu = False
+    else:
+        device, using_gpu = _select_espirit_device(
+            mode=espirit_device,
+            gpu_index=espirit_gpu_index,
+        )
 
     # The integrated refscan layout uses the last set for ACS.
     data_ref = load_ref(mprage_data_file)
@@ -833,18 +862,21 @@ def generate_coil_sens(
         cp.get_default_memory_pool().free_all_blocks()
     gc.collect()
 
-    kspace_low_cc_sp = sp.to_device(kspace_low_cc_np, device)
-
-    # Generate low-res coil sensitivity maps
-    csm_low_cc = mr.app.EspiritCalib(
-        kspace_low_cc_sp,
-        calib_width=24,
+    # The slice2d backend receives logical k-space only after the existing
+    # readout-oversampling removal above. It transforms logical RO to hybrid
+    # space and preserves the joint LIN/PAR calibration plane.
+    csm_low_cc_np, espirit_info = estimate_espirit_maps(
+        kspace_low_cc_np,
+        mode=espirit_calib_mode,
         device=device,
         crop=espirit_crop,
-        show_pbar=True,
-    ).run()
-
-    csm_low_cc_np = sp.to_device(csm_low_cc, sp.Device(-1))
+        calib_width=24,
+        thresh=0.02,
+        kernel_width=6,
+        max_iter=100,
+        cpu_workers=espirit_cpu_workers,
+    )
+    print("ESPIRiT execution info:", espirit_info)
     print("csm_low_cc_np:", csm_low_cc_np.shape)
 
     # zoom to full res coil sensitivity maps
@@ -865,17 +897,17 @@ def generate_coil_sens(
     rss = np.sqrt(np.sum(np.abs(csm_full_cc_np) ** 2, axis=0, keepdims=True))
     csm_full_cc_np /= np.maximum(rss, 1e-8)
 
-    # save
+    # Save the Wcc once, but keep sensitivity-map products mode-specific so
+    # --reuse-coil-calib cannot silently mix 3d and slice2d estimates.
     _save_npy(out_folder + 'coil_compression_energy_' + file_tag, Wcc, 'coil compression matrix')
-    _save_npy(out_folder + 'csm_acs_' + file_tag, csm_low_cc_np, 'low-resolution ESPIRiT CSM')
-    _save_npy(out_folder + 'csm_full_' + file_tag, csm_full_cc_np, 'full-resolution ESPIRiT CSM')
-
+    _save_npy(out_folder + 'csm_acs_' + csm_tag, csm_low_cc_np, 'low-resolution ESPIRiT CSM')
+    _save_npy(out_folder + 'csm_full_' + csm_tag, csm_full_cc_np, 'full-resolution ESPIRiT CSM')
     plot_csm_magnitude_grid(csm_full_cc_np, z=csm_full_cc_np.shape[-1] // 2)
-    mag_png = out_folder + f'csm_full_mag_' + file_tag + '.png'
+    mag_png = out_folder + 'csm_full_mag_' + csm_tag + '.png'
     print(f"Saving CSM magnitude plot to: {mag_png}")
     plt.savefig(mag_png, dpi=150)
     plot_csm_phase_grid(csm_full_cc_np, z=csm_full_cc_np.shape[-1] // 2)
-    phase_png = out_folder + f'csm_full_phase_' + file_tag + '.png'
+    phase_png = out_folder + 'csm_full_phase_' + csm_tag + '.png'
     print(f"Saving CSM phase plot to: {phase_png}")
     plt.savefig(phase_png, dpi=150)
     plt.close('all')
@@ -1427,7 +1459,7 @@ def _parse_cli_args():
         help="Suffix tag used in output filenames.",
     )
     parser.add_argument("--reuse-coil-calib", action="store_true",
-                        help="Reuse existing coil_compression_energy_<tag>.npy and csm_full_<tag>.npy if present.")
+                        help="Reuse the existing coil-compression matrix and the CSM cache for the selected ESPIRiT calibration mode when both are present.")
     parser.add_argument(
         "--espirit-device",
         choices=("auto", "cpu", "gpu"),
@@ -1447,6 +1479,26 @@ def _parse_cli_args():
         help=(
             "ESPIRiT eigenvalue crop threshold. Lower values generally retain "
             "a larger sensitivity-map support region. Default: 0.8."
+        ),
+    )
+    parser.add_argument(
+        "--espirit-calib-mode",
+        choices=("3d", "slice2d"),
+        default=None,
+        help=(
+            "ESPIRiT calibration backend. '3d' is the native reference method "
+            "and remains the default. 'slice2d' performs CPU-parallel 2D "
+            "calibration over logical-RO hybrid-space slices."
+        ),
+    )
+    parser.add_argument(
+        "--espirit-cpu-workers",
+        type=int,
+        default=None,
+        help=(
+            "CPU process workers for --espirit-calib-mode slice2d. By default "
+            "the available physical-core count is used, limited by the number "
+            "of logical readout slices."
         ),
     )
     parser.add_argument("--yflip", type=int, default=None,
@@ -1569,6 +1621,17 @@ def _npy_output_path(path_without_ext):
     return path_without_ext if path_without_ext.endswith(".npy") else path_without_ext + ".npy"
 
 
+def _espirit_cache_tag(file_tag, mode):
+    """Return a mode-specific tag while retaining legacy 3D filenames."""
+    mode = str(mode).strip().lower()
+    file_tag = str(file_tag)
+    if mode == "3d":
+        return file_tag
+    if mode == "slice2d":
+        return "slice2d" if file_tag == "" else "slice2d_" + file_tag
+    raise ValueError("ESPIRiT calibration mode must be '3d' or 'slice2d'.")
+
+
 def _save_npy(path_without_ext, array, label):
     """Save a NumPy/PyTorch object and print the exact output path."""
     out_path = _npy_output_path(path_without_ext)
@@ -1655,6 +1718,26 @@ def _collect_runtime_config():
     if not np.isfinite(espirit_crop_value) or not 0.0 <= espirit_crop_value <= 1.0:
         raise ValueError("--espirit-crop must be a finite value between 0 and 1.")
 
+    espirit_calib_mode_value = cli.espirit_calib_mode
+    if espirit_calib_mode_value is None:
+        espirit_calib_mode_value = globals().get("espirit_calib_mode", "3d")
+    espirit_calib_mode_value = str(espirit_calib_mode_value).strip().lower()
+    if espirit_calib_mode_value not in ("3d", "slice2d"):
+        raise ValueError("espirit_calib_mode must be '3d' or 'slice2d'.")
+
+    if cli.espirit_cpu_workers is not None:
+        espirit_cpu_workers_value = int(cli.espirit_cpu_workers)
+    else:
+        global_workers = globals().get("espirit_cpu_workers", None)
+        espirit_cpu_workers_value = None if global_workers in (None, "") else int(global_workers)
+    if espirit_cpu_workers_value is not None and espirit_cpu_workers_value < 1:
+        raise ValueError("--espirit-cpu-workers must be a positive integer.")
+    if espirit_calib_mode_value == "slice2d" and espirit_device_value == "gpu":
+        raise ValueError(
+            "--espirit-calib-mode slice2d is CPU-only; use --espirit-device cpu "
+            "or auto, or select --espirit-calib-mode 3d."
+        )
+
     yflip_value = _get_optional_int("yflip", cli.yflip, default=-1, allowed_values=(-1, 1))
     zflip_value = _get_optional_int("zflip", cli.zflip, default=-1, allowed_values=(-1, 1))
 
@@ -1739,7 +1822,15 @@ def _collect_runtime_config():
     print(f"  reuse_coil_calib:  {reuse_coil_calib_value}")
     print("  coil compression: CPU")
     print(f"  ESPIRiT request:  {espirit_device_value} (GPU index {espirit_gpu_index_value})")
+    print(f"  ESPIRiT mode:     {espirit_calib_mode_value}")
     print(f"  ESPIRiT crop:     {espirit_crop_value:g}")
+    if espirit_calib_mode_value == "slice2d":
+        print(
+            "  ESPIRiT workers:  "
+            + ("auto" if espirit_cpu_workers_value is None else str(espirit_cpu_workers_value))
+        )
+    else:
+        print("  ESPIRiT workers:  n/a (native 3D backend)")
     print("  CG-SENSE:         CPU")
     print(f"  yflip/zflip:       {yflip_value}/{zflip_value}")
     print(f"  save_nifti:        {save_nifti_value}")
@@ -1763,6 +1854,8 @@ def _collect_runtime_config():
         "espirit_device": espirit_device_value,
         "espirit_gpu_index": espirit_gpu_index_value,
         "espirit_crop": espirit_crop_value,
+        "espirit_calib_mode": espirit_calib_mode_value,
+        "espirit_cpu_workers": espirit_cpu_workers_value,
         "yflip": yflip_value,
         "zflip": zflip_value,
         "save_nifti": save_nifti_value,
