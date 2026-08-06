@@ -741,8 +741,9 @@ def load_or_generate_coil_sens(
     espirit_cpu_workers=None,
 ):
     """Load cached Wcc/CSM or generate them from the integrated ACS refscan set."""
+    csm_tag = _espirit_cache_tag(file_tag, espirit_calib_mode)
     wcc_file = _npy_output_path(out_folder + 'coil_compression_energy_' + file_tag)
-    csm_file = _npy_output_path(out_folder + 'csm_full_' + file_tag)
+    csm_file = _npy_output_path(out_folder + 'csm_full_' + csm_tag)
 
     if reuse_coil_calib and os.path.isfile(wcc_file) and os.path.isfile(csm_file):
         print("Reusing existing coil compression matrix and coil sensitivity maps.")
@@ -875,6 +876,20 @@ def generate_coil_sens(
         kernel_width=6,
         max_iter=100,
         cpu_workers=espirit_cpu_workers,
+        # SAG-specific whole-plane guard: logical RO is physical z / S-I.
+        # These conservative defaults retain superior scalp and inferior
+        # jaw/neck through three-slice padding while rejecting noise-only
+        # whole RO planes. Native 3D ESPIRiT is unaffected.
+        slice_support="sag" if espirit_calib_mode == "slice2d" else "off",
+        slice_support_noise_fraction=0.10,
+        slice_support_noise_multiplier=3.0,
+        slice_support_relative_floor=1e-4,
+        slice_support_padding=3,
+        slice_support_diagnostic_path=(
+            out_folder + "espirit_slice2d_sag_ro_support_" + csm_tag + ".png"
+            if espirit_calib_mode == "slice2d"
+            else None
+        ),
     )
     print("ESPIRiT execution info:", espirit_info)
     print("csm_low_cc_np:", csm_low_cc_np.shape)
@@ -893,9 +908,25 @@ def generate_coil_sens(
         + 1j * zoom(csm_low_cc_np.imag, zoom_factors, order=1)
     ).astype(np.complex64)
 
-    # Normalize RSS across coils.
+    if espirit_calib_mode == "slice2d" and espirit_info.masked_low_signal_slices:
+        # Logical RO already has the final non-oversampled Nx length, so the
+        # low-resolution SAG support indices map directly to full CSM axis 1.
+        csm_full_cc_np[
+            :,
+            list(espirit_info.masked_low_signal_slices),
+            :,
+            :,
+        ] = 0
+
+    # Normalize RSS across coils without converting masked zero planes into
+    # unit-norm maps.
     rss = np.sqrt(np.sum(np.abs(csm_full_cc_np) ** 2, axis=0, keepdims=True))
-    csm_full_cc_np /= np.maximum(rss, 1e-8)
+    csm_full_cc_np = np.divide(
+        csm_full_cc_np,
+        rss,
+        out=np.zeros_like(csm_full_cc_np),
+        where=rss > 1e-8,
+    )
 
     # Save the Wcc once, but keep sensitivity-map products mode-specific so
     # --reuse-coil-calib cannot silently mix 3d and slice2d estimates.
@@ -1488,7 +1519,8 @@ def _parse_cli_args():
         help=(
             "ESPIRiT calibration backend. '3d' is the native reference method "
             "and remains the default. 'slice2d' performs CPU-parallel 2D "
-            "calibration over logical-RO hybrid-space slices."
+            "calibration over logical-RO hybrid-space slices and applies a "
+            "conservative SAG whole-plane RO support guard (physical S-I)."
         ),
     )
     parser.add_argument(
@@ -1622,13 +1654,16 @@ def _npy_output_path(path_without_ext):
 
 
 def _espirit_cache_tag(file_tag, mode):
-    """Return a mode-specific tag while retaining legacy 3D filenames."""
+    """Return a mode-specific CSM tag for the SAG MPRAGE implementation."""
     mode = str(mode).strip().lower()
     file_tag = str(file_tag)
     if mode == "3d":
         return file_tag
     if mode == "slice2d":
-        return "slice2d" if file_tag == "" else "slice2d_" + file_tag
+        # The SAG whole-plane RO guard changes the estimator output, so use a
+        # distinct cache tag rather than reusing pre-guard slice2d CSMs.
+        prefix = "slice2d_sagmask"
+        return prefix if file_tag == "" else prefix + "_" + file_tag
     raise ValueError("ESPIRiT calibration mode must be '3d' or 'slice2d'.")
 
 
@@ -1829,6 +1864,7 @@ def _collect_runtime_config():
             "  ESPIRiT workers:  "
             + ("auto" if espirit_cpu_workers_value is None else str(espirit_cpu_workers_value))
         )
+        print("  SAG RO support:   auto whole-plane guard, S-I, padding=3")
     else:
         print("  ESPIRiT workers:  n/a (native 3D backend)")
     print("  CG-SENSE:         CPU")
