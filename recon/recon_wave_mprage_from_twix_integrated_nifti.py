@@ -414,6 +414,7 @@ def save_mprage_output_to_nifti(
         apply_array_axis_flips,
         crop_readout_oversampling,
         make_nifti_affine_from_twix,
+        normalize_magnitude,
         prepare_image_array,
         save_nifti_with_json,
     )
@@ -429,9 +430,24 @@ def save_mprage_output_to_nifti(
     img_crop = crop_readout_oversampling(img_np, crop_readout_os=crop_readout_os)
     print(f"NIfTI readout crop: {img_np.shape} -> {img_crop.shape} using crop_readout_os={crop_readout_os}")
 
-    outputs = [("mag", prepare_image_array(img_crop, part="mag"))]
+    magnitude = prepare_image_array(img_crop, part="mag")
+    magnitude, magnitude_normalization = normalize_magnitude(
+        magnitude,
+        percentile=99.0,
+    )
+
+    print(
+        "NIfTI magnitude normalization: "
+        f"positive-voxel p{magnitude_normalization['Percentile']:g} "
+        f"{magnitude_normalization['InputPercentileValue']:.6g} -> 1.0 "
+        "(no clipping)"
+    )
+
+    outputs = [("mag", magnitude)]
     if save_phase:
-        outputs.append(("phase", prepare_image_array(img_crop, part="phase")))
+        outputs.append(
+            ("phase", prepare_image_array(img_crop, part="phase"))
+        )
 
     images_to_flip = [arr for _, arr in outputs]
     images_to_flip = apply_array_axis_flips(images_to_flip, twix_array_axis_flips)
@@ -480,12 +496,20 @@ def save_mprage_output_to_nifti(
 
         sidecar = dict(base_metadata)
         sidecar["Part"] = part
-        sidecar["Units"] = "rad" if part == "phase" else "arbitrary"
-        sidecar["ImageProcessing"] = (
-            "angle(complex_image), after readout-oversampling crop"
-            if part == "phase" else
-            "abs(complex_image), after readout-oversampling crop"
-        )
+
+        if part == "phase":
+            sidecar["Units"] = "rad"
+            sidecar["ImageProcessing"] = (
+                "angle(complex_image), after readout-oversampling crop"
+            )
+        else:
+            sidecar["Units"] = "relative"
+            sidecar["MagnitudeNormalization"] = magnitude_normalization
+            sidecar["ImageProcessing"] = (
+                "abs(complex_image), after readout-oversampling crop; "
+                "scaled so the 99th percentile of positive finite voxels "
+                "equals 1.0; not clipped"
+            )
         save_nifti_with_json(arr, affine, nii_path, json_path, metadata=sidecar)
 
 
@@ -881,10 +905,10 @@ def generate_coil_sens(
         # jaw/neck through three-slice padding while rejecting noise-only
         # whole RO planes. Native 3D ESPIRiT is unaffected.
         slice_support="sag" if espirit_calib_mode == "slice2d" else "off",
-        slice_support_noise_fraction=0.10,
-        slice_support_noise_multiplier=3.0,
-        slice_support_relative_floor=1e-4,
-        slice_support_padding=3,
+        slice_support_noise_fraction=0.03,
+        slice_support_noise_multiplier=1.5,
+        slice_support_relative_floor=1e-5,
+        slice_support_padding=20,
         slice_support_diagnostic_path=(
             out_folder + "espirit_slice2d_sag_ro_support_" + csm_tag + ".png"
             if espirit_calib_mode == "slice2d"

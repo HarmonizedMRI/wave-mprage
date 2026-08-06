@@ -91,8 +91,8 @@ Use the same `--out` directory, `--file-tag`, and `--espirit-calib-mode`. The sc
 
 ```text
 coil_compression_energy_<tag>.npy
-csm_full_<tag>.npy                 # 3d
-csm_full_slice2d_<tag>.npy         # slice2d
+csm_full_<tag>.npy                         # native 3d
+csm_full_slice2d_sagmask_<tag>.npy         # SAG slice2d with RO support guard
 ```
 
 The supported option is `--reuse-coil-calib` rather than `--reuse-exist-calib`. Reuse these files only when the TWIX measurement, receive-coil selection, geometry, ACS dimensions, oversampling, compression settings, reconstruction dimensions, calibration mode, and intended crop value are unchanged. A newly supplied `--espirit-crop` value is not reapplied to an existing cached map. If any relevant setting differs, rerun without the reuse option.
@@ -196,6 +196,8 @@ The implementation removes readout oversampling before transforming logical RO t
 
 Native 3D remains the reference estimator. Compare representative 3D and slice2d results before adopting slice2d routinely. Reuse validated mode-specific calibration files with `--reuse-coil-calib` when appropriate.
 
+For sagittal MPRAGE, the slice2d path also uses a superior-inferior whole-RO-plane support guard. Inspect its diagnostic output before accepting the maps, particularly at the top of the scalp and the inferior jaw/neck.
+
 ## Choose the slice2d CPU-worker count on Linux
 
 Inspect the machine topology with:
@@ -260,6 +262,185 @@ Use one of:
 --espirit-calib-mode 3d --espirit-device gpu
 ```
 
+## SAG slice2d RO mask removes superior or inferior anatomy
+
+This section applies only to sagittal Wave-MPRAGE reconstructed with:
+
+```text
+--espirit-calib-mode slice2d
+```
+
+For the validated SAG geometry, logical RO is physical `z`, corresponding to the superior-inferior direction. The slice2d support guard examines each complete logical-RO plane and sets low-signal planes to zero before the per-plane ESPIRiT calibration. It is intended to reject noise-only planes at the two ends of the superior-inferior FOV.
+
+The guard and `--espirit-crop` act at different stages:
+
+```text
+SAG RO support guard
+    removes or retains complete superior-inferior planes
+
+--espirit-crop
+    controls the in-plane ESPIRiT eigenvalue support within retained planes
+```
+
+Therefore, changing `--espirit-crop` cannot restore a complete RO plane that the SAG support guard has already masked.
+
+### Identify which mask caused the clipping
+
+Inspect the saved diagnostic products:
+
+```text
+espirit_slice2d_sag_ro_support_slice2d_sagmask_<tag>.png
+espirit_slice2d_sag_ro_support_slice2d_sagmask_<tag>.npz
+```
+
+The PNG shows the normalized hybrid-space RO-plane RMS, the support threshold, and the planes rejected by the guard.
+
+- If the missing superior or inferior plane is marked as rejected, adjust the SAG support parameters.
+- If the plane is retained but pixels within that plane are absent from the CSM, adjust `--espirit-crop`.
+- If the plane and its in-plane CSM support are both present but anatomy remains absent in the reconstruction, investigate calibration SNR, receive-coil coverage, and the reconstruction operator rather than either mask.
+
+### Recommended tuning order
+
+Keep the ESPIRiT crop fixed at `0.8` while tuning the whole-plane guard. Change one group of parameters at a time in this order:
+
+1. Increase `slice_support_padding`.
+2. Lower `slice_support_noise_multiplier`.
+3. Lower `slice_support_relative_floor`.
+4. Reduce `slice_support_noise_fraction` when only a few truly empty edge planes exist.
+5. Adjust `--espirit-crop` only after the superior-inferior plane support is correct.
+
+The support parameters are currently named arguments in the `estimate_espirit_maps(...)` call in the MPRAGE reconstruction script.
+
+### Top-of-head or inferior anatomy is clipped
+
+Small superior head-cap planes and inferior jaw/neck planes can have low whole-plane RMS because the signal occupies only a small fraction of the LIN-PAR plane. Start by increasing the safety padding:
+
+```python
+slice_support_padding=8
+```
+
+For approximately 1 mm logical-RO resolution, this preserves about 8 mm beyond each detected support boundary. If necessary, try:
+
+```python
+slice_support_padding=10
+```
+
+or:
+
+```python
+slice_support_padding=12
+```
+
+Padding is the safest first adjustment because it restores an anatomical margin without lowering the support threshold throughout the full FOV.
+
+If padding alone is insufficient, reduce the required signal above the estimated noise floor:
+
+```python
+slice_support_noise_multiplier=1.5
+```
+
+A practical testing range is:
+
+```text
+1.5 -> 2.0 -> 2.5
+```
+
+Lower values preserve weaker planes. Higher values reject edge noise more aggressively.
+
+Next, reduce the threshold relative to the strongest RO plane:
+
+```python
+slice_support_relative_floor=1e-5
+```
+
+If weak superior or inferior anatomy remains clipped, test:
+
+```python
+slice_support_relative_floor=0.0
+```
+
+With a value of zero, the noise-floor criterion alone determines the threshold.
+
+When the acquired FOV contains only a small number of genuinely empty RO planes, reduce the fraction used to estimate the noise floor:
+
+```python
+slice_support_noise_fraction=0.05
+```
+
+or, more conservatively:
+
+```python
+slice_support_noise_fraction=0.03
+```
+
+A value that is too large can include weak anatomical planes in the noise estimate and make the threshold overly aggressive.
+
+### Recommended conservative SAG settings
+
+A reasonable first adjustment for superior or inferior clipping is:
+
+```python
+slice_support_noise_fraction=0.05
+slice_support_noise_multiplier=1.5
+slice_support_relative_floor=1e-5
+slice_support_padding=10
+```
+
+Keep:
+
+```text
+--espirit-crop 0.8
+```
+
+during this comparison.
+
+If anatomy remains clipped:
+
+```python
+slice_support_noise_fraction=0.03
+slice_support_noise_multiplier=1.5
+slice_support_relative_floor=0.0
+slice_support_padding=12
+```
+
+If lateral or edge noise-only planes return, increase only the noise multiplier first:
+
+```python
+slice_support_noise_multiplier=2.0
+```
+
+### Edge noise remains after relaxing the mask
+
+If noise-only superior or inferior planes return:
+
+- increase `slice_support_noise_multiplier` gradually;
+- reduce excessive padding;
+- keep `slice_support_relative_floor` small unless the noise-floor estimate is unreliable;
+- confirm the diagnostic curve shows a clear flat edge-noise plateau.
+
+Do not raise `--espirit-crop` specifically to reject complete noise-only RO planes. Crop acts within each retained plane and may remove valid low-SNR anatomy without reliably solving a whole-plane failure.
+
+### Recompute after every support-mask change
+
+The support decision is already embedded in the saved CSM. Do not use:
+
+```text
+--reuse-coil-calib
+```
+
+when comparing support-mask settings. Delete the existing SAG slice2d CSM cache or use a new `--file-tag`:
+
+```text
+csm_acs_slice2d_sagmask_<tag>.npy
+csm_full_slice2d_sagmask_<tag>.npy
+```
+
+The coil-compression matrix may remain reusable when all coil-compression inputs are unchanged, but the current reconstruction recomputes the calibration products together when cache reuse is disabled.
+
+### Limitation of the current score
+
+The guard uses one RMS score per complete LIN-PAR plane. This is intentionally simple, but it can undervalue valid superior slices where the head occupies only a small area. If extensive tuning is required across subjects, consider changing the score to a robust high-percentile or top-fraction signal statistic rather than continuing to lower global thresholds.
+
 ## ESPIRiT crop removes low-SNR anatomy
 
 `--espirit-crop` remains active in both `3d` and `slice2d` modes. Higher values create a stricter support mask; lower values retain broader support. In slice2d mode the threshold is applied independently to each logical-RO plane.
@@ -316,8 +497,8 @@ Delete or disable the cached files when geometry, readout oversampling, ACS size
 
 ```text
 coil_compression_energy_<tag>.npy
-csm_full_<tag>.npy                 # 3d
-csm_full_slice2d_<tag>.npy         # slice2d
+csm_full_<tag>.npy                         # native 3d
+csm_full_slice2d_sagmask_<tag>.npy         # SAG slice2d with RO support guard
 ```
 
 Then rerun without `--reuse-coil-calib`.

@@ -380,6 +380,59 @@ def prepare_image_array(arr: np.ndarray, part: str = "mag") -> np.ndarray:
     return np.nan_to_num(out.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def normalize_magnitude(
+    arr: np.ndarray,
+    percentile: float = 99.0,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Scale a magnitude image so its positive-voxel percentile equals 1.0."""
+    percentile = float(percentile)
+    if not np.isfinite(percentile) or not 0.0 < percentile <= 100.0:
+        raise ValueError(
+            "percentile must be finite and in the interval (0, 100]."
+        )
+
+    mag = np.asarray(arr, dtype=np.float32)
+    if mag.ndim != 3:
+        raise ValueError(
+            f"Expected a 3D magnitude array, got shape {mag.shape}."
+        )
+
+    mag = np.nan_to_num(
+        mag,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    mag = np.maximum(mag, 0.0)
+
+    # Ignore zero-valued background when calculating the scale.
+    positive = mag[mag > 0.0]
+    if positive.size == 0:
+        raise ValueError(
+            "Magnitude image has no positive finite pixels to normalize."
+        )
+
+    scale = float(np.percentile(positive, percentile))
+    if not np.isfinite(scale) or scale <= np.finfo(np.float32).tiny:
+        raise ValueError(
+            f"Invalid magnitude normalization scale at percentile "
+            f"{percentile:g}: {scale}."
+        )
+
+    normalized = np.ascontiguousarray(
+        (mag / scale).astype(np.float32, copy=False)
+    )
+
+    info = {
+        "Method": "positive-finite-percentile",
+        "Percentile": percentile,
+        "InputPercentileValue": scale,
+        "OutputPercentileValue": 1.0,
+        "Clipped": False,
+    }
+    return normalized, info
+    
+
 def clean_magnitude(
     arr: np.ndarray,
     percentile: float = 99.0,
