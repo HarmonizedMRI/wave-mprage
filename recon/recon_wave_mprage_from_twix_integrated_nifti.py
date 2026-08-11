@@ -56,6 +56,7 @@ from scipy.ndimage import zoom
 from utils.twix_import import *
 from utils.coil_compression_kspace import *
 from utils.plot_coil_sens import *
+from utils.bart_io import export_wave_inputs
 from utils.espirit_calibration import estimate_espirit_maps
 
 from utils.psf_wrapped_phase_fit import fit_wrapped_phase_planes
@@ -104,6 +105,7 @@ def main():
     psf_coefficient_processing = cfg["psf_coefficient_processing"]
     psf_fit_kx_min = cfg["psf_fit_kx_min"]
     psf_fit_kx_max = cfg["psf_fit_kx_max"]
+    save_bart_inputs = cfg["save_bart_inputs"]
 
     seq = pp.Sequence()
     seq.read(mprage_seq_file, remove_duplicates=False)
@@ -233,6 +235,29 @@ def main():
             fit_kx_max=psf_fit_kx_max,
         )
         print("Generated calibrated PSF")
+
+        if save_bart_inputs:
+            bart_tag = _sanitize_filename_component(file_tag) if file_tag else ""
+            bart_folder = Path(out_folder) / (
+                "bart_inputs" + (f"_{bart_tag}" if bart_tag else "")
+            )
+            kspace_calib = _build_bart_calibration_kspace(
+                mprage_data_file=mprage_data_file,
+                Nx=Nx,
+                Ny=Ny,
+                Nz=Nz,
+                os_factor=os_factor,
+                Nacs=nacs,
+                Wcc=Wcc,
+            )
+            manifest_path = export_wave_inputs(
+                bart_folder,
+                wave_kspace=kspace_cc_echo.unsqueeze(3).numpy(),
+                calibrated_psf=psf_calib.unsqueeze(0).numpy(),
+                coil_sens=csm_full_cc_np,
+                kspace_calib=kspace_calib,
+            )
+            print(f"Saved BART Wave-CAIPI inputs: {manifest_path}")
 
         psf_to_use = psf_calib.clone()
         # psf_to_use = psf_theory.clone()
@@ -971,6 +996,40 @@ def generate_coil_sens(
     return Wcc, csm_full_cc_np, Ncoil
 
 
+def _build_bart_calibration_kspace(
+    *,
+    mprage_data_file,
+    Nx,
+    Ny,
+    Nz,
+    os_factor,
+    Nacs,
+    Wcc,
+):
+    """Return compressed integrated ACS on BART's full logical image grid."""
+
+    data_ref = load_ref(mprage_data_file)
+    _check_integrated_refscan_shape(data_ref, Nacs=Nacs, Ncalib=None)
+    kspace_acs = data_ref[:, :Nacs, :Nacs, -1, :]
+    kspace_acs_cc = apply_cc_coillast_torch(kspace_acs, Wcc, x_chunk=8)
+    kspace_acs_cc = kspace_acs_cc[::os_factor]
+    ncc = int(Wcc.shape[1])
+    expected = (Nx, Nacs, Nacs, ncc)
+    if tuple(kspace_acs_cc.shape) != expected:
+        raise ValueError(
+            "Unexpected compressed BART calibration shape: "
+            f"received {tuple(kspace_acs_cc.shape)}, expected {expected}."
+        )
+    if Nacs > Ny or Nacs > Nz:
+        raise ValueError(f"ACS size {Nacs} does not fit BART grid {(Nx, Ny, Nz)}.")
+
+    full = torch.zeros((Nx, Ny, Nz, ncc), dtype=torch.complex64)
+    y0 = (Ny - Nacs) // 2
+    z0 = (Nz - Nacs) // 2
+    full[:, y0 : y0 + Nacs, z0 : z0 + Nacs, :] = kspace_acs_cc
+    return full.numpy()
+
+
 # -----------------------------------------------------------------------------
 # Integrated PSF calibration handling
 # -----------------------------------------------------------------------------
@@ -1565,6 +1624,14 @@ def _parse_cli_args():
                         help="Also save the reconstructed image as NIfTI after center-cropping readout oversampling.")
     parser.add_argument("--save-nifti-phase", action="store_true",
                         help="When --save-nifti is used, also save phase in radians. Magnitude is always saved.")
+    parser.add_argument(
+        "--save-bart-inputs",
+        action="store_true",
+        help=(
+            "Export BART CFL inputs under <out>/bart_inputs[_tag]. This is "
+            "available for wave acquisitions only."
+        ),
+    )
     parser.add_argument("--nifti-out-folder", default=None,
                         help="Folder for NIfTI outputs. Default: <out-folder>/nifti/.")
     parser.add_argument("--nifti-sub", default=None,
@@ -1753,6 +1820,11 @@ def _collect_runtime_config():
         Nacs=mode_nacs,
         slice_orientation=mode_orientation,
     )
+    save_bart_inputs_value = bool(
+        cli.save_bart_inputs or globals().get("save_bart_inputs", False)
+    )
+    if save_bart_inputs_value and tag_wave_value != "wave":
+        raise ValueError("--save-bart-inputs requires a wave acquisition.")
 
     reuse_coil_calib_value = bool(cli.reuse_coil_calib or globals().get("reuse_coil_calib", False))
     espirit_device_value = cli.espirit_device
@@ -1894,6 +1966,7 @@ def _collect_runtime_config():
     print("  CG-SENSE:         CPU")
     print(f"  yflip/zflip:       {yflip_value}/{zflip_value}")
     print(f"  save_nifti:        {save_nifti_value}")
+    print(f"  save_bart_inputs:  {save_bart_inputs_value}")
     if save_nifti_value:
         print(f"  nifti_out_folder:  {nifti_out_folder_value}")
         print(f"  nifti_sub:         {nifti_sub_value if nifti_sub_value else '<auto>'}")
@@ -1920,6 +1993,7 @@ def _collect_runtime_config():
         "zflip": zflip_value,
         "save_nifti": save_nifti_value,
         "save_nifti_phase": save_nifti_phase_value,
+        "save_bart_inputs": save_bart_inputs_value,
         "nifti_out_folder": nifti_out_folder_value,
         "nifti_sub": nifti_sub_value,
         "nifti_suffix": nifti_suffix_value,

@@ -174,6 +174,12 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
   --save-nifti-phase
 ```
 
+Add `--save-bart-inputs` to export the calibrated PSF, coil-compressed
+k-space, sensitivity maps, and integrated ACS as BART CFL pairs. The companion
+`recon/run_bart_wave_recon.sh` script runs BART `ecalib` and `wave`; see
+[Reconstruction](docs/reconstruction.md#bart-wave-caipi-input-export) for the
+exact dimensions and command.
+
 Force CPU ESPIRiT while explicitly requiring wave reconstruction:
 
 ```bash

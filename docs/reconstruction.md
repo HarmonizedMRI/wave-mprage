@@ -108,6 +108,32 @@ The old `--data-folder` argument is not part of the direct-path interface. Suppl
 10. Run wave or no-wave CG-SENSE on CPU.
 11. Save `.npy` arrays, diagnostic plots, and optional NIfTI outputs.
 
+## BART Wave-CAIPI input export
+
+Add `--save-bart-inputs` to a wave reconstruction to write BART-compatible
+`.hdr`/`.cfl` pairs under `<out>/bart_inputs` (or `bart_inputs_<tag>` when
+`--file-tag` is set).
+
+| Basename | BART shape | Contents |
+|---|---|---|
+| `wave_kspace` | `(Nx_os, Ny, Nz, Ncc, 1)` | Coil-compressed acquired k-space |
+| `psf` | `(Nx_os, Ny, Nz, 1, 1)` | Calibrated wave PSF |
+| `coil_sens` | `(Nx, Ny, Nz, Ncc, 1)` | Sensitivity maps from this reconstruction |
+| `kspace_calib` | `(Nx, Ny, Nz, Ncc)` | Coil-compressed, centered integrated ACS |
+
+The companion script runs BART ESPIRiT calibration and Wave-CAIPI
+reconstruction:
+
+```bash
+recon/run_bart_wave_recon.sh \
+  /path/to/output/bart_inputs \
+  /path/to/output/bart_reconstruction
+```
+
+It defaults to the maps produced by `bart ecalib -m 1 -c 0.8`. Pass
+`--maps-source exported` to use the Python pipeline's `coil_sens` instead.
+The generated `manifest.json` records every basename and dimension.
+
 ## PSF coefficient processing
 
 For wave reconstruction, the projection calibration first estimates the readout-dependent phase-plane coefficients `a(kx)`, `b(kx)`, and `c(kx)`. The final coefficient-processing method is selected with:

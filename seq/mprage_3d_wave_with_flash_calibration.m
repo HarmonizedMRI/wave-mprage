@@ -165,8 +165,8 @@ etlSeg.savedMin  = 16;
 
 % These flags affect MPRAGE only. Calibration always acquires its required
 % no-wave, sine-wave, and cosine-wave parts from the shared event library.
-isUseWave_cos = true;
-isUseWave_sin = true;
+isUseWave_cos = false;
+isUseWave_sin = false;
 
 assert(R1 >= 1 && R1 == round(R1), 'R1 must be a positive integer.');
 assert(R2 >= 1 && R2 == round(R2), 'R2 must be a positive integer.');
