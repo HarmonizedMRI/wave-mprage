@@ -26,6 +26,11 @@ The repository has two intentionally separate parts:
 │   └── utils/
 ├── recon/
 │   ├── recon_wave_mprage_from_twix_integrated_nifti.py
+│   ├── bart/
+│   │   ├── run_wave_recon.sh
+│   │   ├── wave_to_nifti.py
+│   │   └── bart_utils/
+│   ├── tests/
 │   └── utils/
 └── external/
 ```
@@ -176,7 +181,7 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
 
 Add `--save-bart-inputs` to export the calibrated PSF, coil-compressed
 k-space, sensitivity maps, and integrated ACS as BART CFL pairs. The companion
-`recon/run_bart_wave_recon.sh` script runs BART `ecalib` and `wave`; see
+`recon/bart/run_wave_recon.sh` script runs BART `ecalib` and `wave`; see
 [Reconstruction](docs/reconstruction.md#bart-wave-caipi-input-export) for the
 exact dimensions and command.
 

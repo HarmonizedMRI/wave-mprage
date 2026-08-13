@@ -121,18 +121,41 @@ Add `--save-bart-inputs` to a wave reconstruction to write BART-compatible
 | `coil_sens` | `(Nx, Ny, Nz, Ncc, 1)` | Sensitivity maps from this reconstruction |
 | `kspace_calib` | `(Nx, Ny, Nz, Ncc)` | Coil-compressed, centered integrated ACS |
 
-The companion script runs BART ESPIRiT calibration and Wave-CAIPI
-reconstruction:
+The companion script runs BART ESPIRiT calibration, Wave-CAIPI reconstruction,
+and NIfTI conversion:
 
 ```bash
-recon/run_bart_wave_recon.sh \
-  /path/to/output/bart_inputs \
-  /path/to/output/bart_reconstruction
+recon/bart/run_wave_recon.sh \
+  --bart-input /path/to/output/bart_inputs \
+  --bart-output /path/to/output/bart_reconstruction \
+  --maps-source bart \
+  --twix /path/to/meas_integrated_wave_mprage.dat \
+  --seq /path/to/matching_wave_mprage.seq \
+  --nifti-output /path/to/output/nifti_bart \
+  --save-phase \
+  --ecalib-options -c 0.8 --end-ecalib-options \
+  --wave-options -w -r 0.001 -f -i 100 -t 1e-6 --end-wave-options
 ```
 
-It defaults to the maps produced by `bart ecalib -m 1 -c 0.8`. Pass
-`--maps-source exported` to use the Python pipeline's `coil_sens` instead.
-The generated `manifest.json` records every basename and dimension.
+Options inside the `--ecalib-options` and `--wave-options` sections are passed
+unchanged to the corresponding BART commands. The helper prints each complete
+command before running it. To skip `ecalib`, use existing maps explicitly:
+
+```bash
+recon/bart/run_wave_recon.sh \
+  --bart-input /path/to/output/bart_inputs \
+  --bart-output /path/to/output/bart_reconstruction \
+  --maps-source existing \
+  --existing-maps /path/to/output/bart_inputs/coil_sens \
+  --twix /path/to/meas_integrated_wave_mprage.dat \
+  --seq /path/to/matching_wave_mprage.seq \
+  --nifti-output /path/to/output/nifti_bart \
+  --wave-options -l -r 0.002 -b 8 -f -i 100 --end-wave-options
+```
+
+The final converter uses matching TWIX geometry and Pulseq metadata, restores
+the k-space norm removed internally by `bart wave`, and does not crop BART's
+already de-oversampled readout. Use `--help` for the complete interface.
 
 ## PSF coefficient processing
 

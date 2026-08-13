@@ -1,4 +1,4 @@
-"""BART CFL export helpers for Wave-CAIPI reconstruction inputs."""
+"""BART CFL I/O and Wave-CAIPI input export helpers."""
 
 from __future__ import annotations
 
@@ -9,12 +9,15 @@ from typing import Any
 import numpy as np
 
 
+def _cfl_base(path: str | Path) -> Path:
+    base = Path(path)
+    return base.with_suffix("") if base.suffix in {".hdr", ".cfl"} else base
+
+
 def write_cfl(path: str | Path, array: np.ndarray) -> Path:
     """Write a complex array as a column-major BART ``.hdr``/``.cfl`` pair."""
 
-    base = Path(path)
-    if base.suffix in {".hdr", ".cfl"}:
-        base = base.with_suffix("")
+    base = _cfl_base(path)
     base.parent.mkdir(parents=True, exist_ok=True)
     data = np.asarray(array, dtype=np.complex64)
     if data.ndim < 1 or any(int(size) < 1 for size in data.shape):
@@ -26,6 +29,48 @@ def write_cfl(path: str | Path, array: np.ndarray) -> Path:
     with base.with_suffix(".cfl").open("wb") as stream:
         np.ravel(data, order="F").tofile(stream)
     return base
+
+
+def read_cfl(path: str | Path, *, trim_trailing_singletons: bool = True) -> np.ndarray:
+    """Read a BART CFL pair, preserving axis order and validating byte count."""
+
+    base = _cfl_base(path)
+    header_path = base.with_suffix(".hdr")
+    data_path = base.with_suffix(".cfl")
+    if not header_path.is_file() or not data_path.is_file():
+        raise FileNotFoundError(f"Missing BART CFL pair: {base}.{{hdr,cfl}}")
+
+    dimension_line = next(
+        (
+            line.strip()
+            for line in header_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ),
+        None,
+    )
+    if dimension_line is None:
+        raise ValueError(f"BART header contains no dimensions: {header_path}")
+    try:
+        shape = tuple(int(value) for value in dimension_line.split())
+    except ValueError as exc:
+        raise ValueError(f"Invalid BART dimensions in {header_path}: {dimension_line!r}") from exc
+    if not shape or any(size < 1 for size in shape):
+        raise ValueError(f"BART dimensions must be positive: {shape}")
+
+    expected_elements = int(np.prod(shape, dtype=np.int64))
+    data = np.fromfile(data_path, dtype=np.complex64)
+    if data.size != expected_elements:
+        raise ValueError(
+            f"BART CFL size mismatch for {data_path}: header expects "
+            f"{expected_elements} complex64 values, file contains {data.size}."
+        )
+    array = data.reshape(shape, order="F")
+    if trim_trailing_singletons:
+        trimmed_shape = list(array.shape)
+        while len(trimmed_shape) > 1 and trimmed_shape[-1] == 1:
+            trimmed_shape.pop()
+        array = array.reshape(tuple(trimmed_shape), order="F")
+    return array
 
 
 def _complex64(name: str, array: Any, ndim: int) -> np.ndarray:
@@ -55,15 +100,14 @@ def export_wave_inputs(
     wx, sy, sz, necho, nc = map(int, kspace.shape)
     if psf.shape != (necho, wx, sy, sz):
         raise ValueError(
-            f"calibrated_psf must have shape {(necho, wx, sy, sz)}; got {psf.shape}."
+            "calibrated_psf shape must be (echo, wx, sy, sz); "
+            f"expected {(necho, wx, sy, sz)}, received {psf.shape}."
         )
     sx = int(maps.shape[1])
     if maps.shape != (nc, sx, sy, sz):
         raise ValueError(f"coil_sens must have shape {(nc, sx, sy, sz)}; got {maps.shape}.")
     if calib.shape != (sx, sy, sz, nc):
-        raise ValueError(
-            f"kspace_calib must have shape {(sx, sy, sz, nc)}; got {calib.shape}."
-        )
+        raise ValueError(f"kspace_calib must have shape {(sx, sy, sz, nc)}; got {calib.shape}.")
 
     exported_maps = np.moveaxis(maps, 0, 3)[..., None]
     write_cfl(destination / "coil_sens", exported_maps)
@@ -82,6 +126,7 @@ def export_wave_inputs(
                 "echo": echo_index + 1,
                 "wave_kspace": kspace_name,
                 "wave_kspace_shape": list(exported_kspace.shape),
+                "wave_kspace_norm": float(np.linalg.norm(exported_kspace)),
                 "psf": psf_name,
                 "psf_shape": list(exported_psf.shape),
             }

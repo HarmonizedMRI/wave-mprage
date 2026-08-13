@@ -56,7 +56,7 @@ from scipy.ndimage import zoom
 from utils.twix_import import *
 from utils.coil_compression_kspace import *
 from utils.plot_coil_sens import *
-from utils.bart_io import export_wave_inputs
+from bart.bart_utils.bart_io import export_wave_inputs
 from utils.espirit_calibration import estimate_espirit_maps
 
 from utils.psf_wrapped_phase_fit import fit_wrapped_phase_planes
@@ -432,8 +432,9 @@ def save_mprage_output_to_nifti(
     """Save one MPRAGE reconstruction as cropped-readout NIfTI files.
 
     The reconstruction image is expected to be in logical array order
-    (readout_os, LIN/phase, PAR/partition). Readout oversampling is cropped
-    only for the NIfTI export; the original .npy output remains unchanged.
+    (readout, LIN/phase, PAR/partition). Native output supplies oversampled
+    readout with ``crop_readout_os > 1``; BART output supplies the logical
+    readout grid with ``crop_readout_os=1``.
     """
     from utils.nifti_export_twix import (
         apply_array_axis_flips,
@@ -454,6 +455,11 @@ def save_mprage_output_to_nifti(
 
     img_crop = crop_readout_oversampling(img_np, crop_readout_os=crop_readout_os)
     print(f"NIfTI readout crop: {img_np.shape} -> {img_crop.shape} using crop_readout_os={crop_readout_os}")
+    readout_processing = (
+        "after readout-oversampling crop"
+        if int(crop_readout_os) > 1
+        else "without an additional readout crop"
+    )
 
     magnitude = prepare_image_array(img_crop, part="mag")
     magnitude, magnitude_normalization = normalize_magnitude(
@@ -525,13 +531,13 @@ def save_mprage_output_to_nifti(
         if part == "phase":
             sidecar["Units"] = "rad"
             sidecar["ImageProcessing"] = (
-                "angle(complex_image), after readout-oversampling crop"
+                f"angle(complex_image), {readout_processing}"
             )
         else:
             sidecar["Units"] = "relative"
             sidecar["MagnitudeNormalization"] = magnitude_normalization
             sidecar["ImageProcessing"] = (
-                "abs(complex_image), after readout-oversampling crop; "
+                f"abs(complex_image), {readout_processing}; "
                 "scaled so the 99th percentile of positive finite voxels "
                 "equals 1.0; not clipped"
             )
