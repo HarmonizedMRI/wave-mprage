@@ -183,7 +183,9 @@ Add `--save-bart-inputs` to export the calibrated PSF, coil-compressed
 k-space, sensitivity maps, and integrated ACS as BART CFL pairs. The companion
 `recon/bart/run_wave_recon.sh` script runs BART `ecalib` and `wave`; see
 [Reconstruction](docs/reconstruction.md#bart-wave-caipi-input-export) for the
-exact dimensions and command.
+exact dimensions and command. It converts results with `python` from the active
+Conda environment or virtual environment, and writes NIfTIs to
+`BART_OUTPUT/nifti` unless an override is supplied.
 
 Force CPU ESPIRiT while explicitly requiring wave reconstruction:
 

@@ -131,7 +131,6 @@ recon/bart/run_wave_recon.sh \
   --maps-source bart \
   --twix /path/to/meas_integrated_wave_mprage.dat \
   --seq /path/to/matching_wave_mprage.seq \
-  --nifti-output /path/to/output/nifti_bart \
   --save-phase \
   --ecalib-options -c 0.8 --end-ecalib-options \
   --wave-options -w -r 0.001 -f -i 100 -t 1e-6 --end-wave-options
@@ -139,7 +138,11 @@ recon/bart/run_wave_recon.sh \
 
 Options inside the `--ecalib-options` and `--wave-options` sections are passed
 unchanged to the corresponding BART commands. The helper prints each complete
-command before running it. To skip `ecalib`, use existing maps explicitly:
+command before running it. If `--nifti-output` is omitted, converted files are
+written to `BART_OUTPUT/nifti`; pass the option only to override that location.
+Conversion uses `python` from the active Conda environment or virtual
+environment. Set `PYTHON_BIN` to select a different interpreter. To skip
+`ecalib`, use existing maps explicitly:
 
 ```bash
 recon/bart/run_wave_recon.sh \
@@ -149,7 +152,7 @@ recon/bart/run_wave_recon.sh \
   --existing-maps /path/to/output/bart_inputs/coil_sens \
   --twix /path/to/meas_integrated_wave_mprage.dat \
   --seq /path/to/matching_wave_mprage.seq \
-  --nifti-output /path/to/output/nifti_bart \
+  --nifti-output /path/to/custom/nifti \
   --wave-options -l -r 0.002 -b 8 -f -i 100 --end-wave-options
 ```
 
