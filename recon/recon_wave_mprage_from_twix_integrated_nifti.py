@@ -424,6 +424,7 @@ def save_mprage_output_to_nifti(
     save_phase=False,
     twix_array_axis_roles=("phase", "readout", "slice"),
     twix_array_axis_flips=(True, False, False),
+    twix_affine_axis_flips=(True, False, True),
     twix_coord_system="LPS",
     twix_inplane_rot_sign=-1.0,
     twix_use_fov_for_voxel_size=False,
@@ -434,10 +435,15 @@ def save_mprage_output_to_nifti(
     The reconstruction image is expected to be in logical array order
     (readout, LIN/phase, PAR/partition). Native output supplies oversampled
     readout with ``crop_readout_os > 1``; BART output supplies the logical
-    readout grid with ``crop_readout_os=1``.
+    readout grid with ``crop_readout_os=1``. ``twix_array_axis_flips`` corrects
+    reconstruction-array indexing, while ``twix_affine_axis_flips`` records
+    the independently validated physical direction of those logical axes.
+    Magnitude and phase are finally permuted/reversed without interpolation so
+    every newly written NIfTI uses canonical RAS storage.
     """
     from utils.nifti_export_twix import (
         apply_array_axis_flips,
+        canonicalize_arrays_to_ras,
         crop_readout_oversampling,
         make_nifti_affine_from_twix,
         normalize_magnitude,
@@ -485,17 +491,28 @@ def save_mprage_output_to_nifti(
     outputs = [(part, arr) for (part, _), arr in zip(outputs, images_to_flip)]
     print(f"Applied NIfTI physical array flips: {tuple(bool(x) for x in twix_array_axis_flips)}")
 
-    affine, voxel_size_from_affine, twix_info = make_nifti_affine_from_twix(
+    affine, _, twix_info = make_nifti_affine_from_twix(
         twix_file=twix_file,
         npy_shape=outputs[0][1].shape,
         twix_array_axis_roles=twix_array_axis_roles,
-        # Flips were applied to image data above, so do not apply them again to the affine.
-        twix_array_axis_flips=(False, False, False),
+        # Product DICOM validation established this logical-axis convention.
+        # It corrects stored voxel directions independently of the array flip
+        # used by the reconstruction before lossless RAS canonicalization.
+        twix_array_axis_flips=twix_affine_axis_flips,
         twix_coord_system=twix_coord_system,
         twix_inplane_rot_sign=twix_inplane_rot_sign,
         twix_use_fov_for_voxel_size=twix_use_fov_for_voxel_size,
         voxel_size_mm=voxel_size_mm,
     )
+    canonical_arrays, affine, orientation_transform = canonicalize_arrays_to_ras(
+        [array for _, array in outputs], affine
+    )
+    outputs = [
+        (part, array)
+        for (part, _), array in zip(outputs, canonical_arrays, strict=True)
+    ]
+    stored_voxel_size_mm = np.linalg.norm(affine[:3, :3], axis=0)
+    print("Stored NIfTI orientation: canonical RAS")
 
     out_dir = Path(out_folder)
     sub_folder = str(nifti_sub)
@@ -507,10 +524,14 @@ def save_mprage_output_to_nifti(
     base_metadata = dict(metadata or {})
     base_metadata.update({
         "NIfTISourceImageShapeBeforeReadoutCrop": [int(v) for v in img_np.shape],
-        "NIfTIImageShapeAfterReadoutCrop": [int(v) for v in outputs[0][1].shape],
-        "NIfTIVoxelSizeMm": [float(v) for v in voxel_size_from_affine],
+        "NIfTIImageShapeAfterReadoutCrop": [int(v) for v in img_crop.shape],
+        "NIfTIStoredImageShape": [int(v) for v in outputs[0][1].shape],
+        "NIfTIVoxelSizeMm": [float(v) for v in stored_voxel_size_mm],
         "NIfTITwixArrayAxisRoles": list(twix_array_axis_roles),
         "NIfTIPhysicalArrayFlipsApplied": [bool(x) for x in twix_array_axis_flips],
+        "NIfTIAffineAxisFlips": [bool(x) for x in twix_affine_axis_flips],
+        "NIfTICanonicalRAS": True,
+        "NIfTIOrientationTransform": orientation_transform,
         "NIfTITwixCoordinateSystemAssumption": twix_coord_system,
         "NIfTITwixInplaneRotationSign": float(twix_inplane_rot_sign),
         "NIfTITwixUseFovForVoxelSize": bool(twix_use_fov_for_voxel_size),

@@ -345,6 +345,42 @@ def apply_array_axis_flips(images: Iterable[np.ndarray], axis_flips: Sequence[bo
     return output
 
 
+def canonicalize_arrays_to_ras(
+    images: Iterable[np.ndarray], affine: np.ndarray
+) -> tuple[list[np.ndarray], np.ndarray, list[list[float]]]:
+    """Reorient matched 3D arrays and their affine to canonical RAS storage.
+
+    This is a lossless permutation/reversal of voxel arrays, not a resampling.
+    All arrays must share the shape described by ``affine`` so magnitude and
+    phase retain identical geometry.
+    """
+    try:
+        import nibabel as nib
+    except ImportError as exc:
+        raise ImportError("Canonical RAS export requires nibabel.") from exc
+
+    arrays = [np.asarray(image) for image in images]
+    if not arrays:
+        raise ValueError("At least one image is required for RAS canonicalization.")
+    shape = arrays[0].shape
+    if len(shape) != 3 or any(array.shape != shape for array in arrays):
+        raise ValueError("Canonical RAS export requires matched 3D image shapes.")
+
+    source = nib.orientations.io_orientation(np.asarray(affine, dtype=float))
+    target = nib.orientations.axcodes2ornt(("R", "A", "S"))
+    transform = nib.orientations.ornt_transform(source, target)
+    canonical = [
+        np.ascontiguousarray(nib.orientations.apply_orientation(array, transform))
+        for array in arrays
+    ]
+    canonical_affine = np.asarray(affine, dtype=float) @ nib.orientations.inv_ornt_aff(
+        transform, shape
+    )
+    if nib.aff2axcodes(canonical_affine) != ("R", "A", "S"):
+        raise ValueError("NIfTI affine could not be canonicalized to RAS.")
+    return canonical, canonical_affine, transform.tolist()
+
+
 def crop_readout_oversampling(arr: np.ndarray, crop_readout_os: int | None = 1) -> np.ndarray:
     """Center-crop readout oversampling along axis 0."""
     arr = np.asarray(arr)
