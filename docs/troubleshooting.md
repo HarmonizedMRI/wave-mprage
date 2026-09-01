@@ -62,7 +62,7 @@ Sine-only and cosine-only MPRAGE imaging trajectories are rejected because the r
 
 ## PSF coefficient curves blow up
 
-Inspect the saved `a(kx)`, `b(kx)`, `c(kx)`, `psf_real`, and `psf_theory` diagnostics. When the direct coefficient fit is trustworthy only within a limited readout region and becomes unstable outside it, rerun with the sine-plus-line coefficient model:
+Inspect the saved `a(kx)`, `b(kx)`, `c(kx)`, `psf_real`, and `psf_theory` diagnostics. The reconstruction continues to use `smooth` by default. To opt into automatic sine-plus-line processing, omit both manual bounds:
 
 ```bash
 uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
@@ -70,14 +70,21 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
   --seq /path/to/data/scan.seq \
   --out /path/to/output \
   --wave-mode wave \
-  --psf-coefficient-processing sine-line \
-  --psf-fit-kx-min 200 \
-  --psf-fit-kx-max 512
+  --psf-coefficient-processing sine-line
 ```
 
-Replace the example bounds with a high-fidelity interval identified from your calibration diagnostics. The interval is `[kx_min, kx_max)`. Both bounds are mandatory in `sine-line` mode.
+Automatic mode normally uses a near-global fit after removing readout edge guards. If center-referenced slope and variance checks detect sustained coefficient corruption, it selects a stable center-containing interval instead. Rejected coefficient or projection-quality samples inside the chosen interval do not enter the fit. Inspect `psf_integrated_calib_fit_<tag>.png` and `psf_sine_line_fit_<tag>.json` for the selected interval, algorithm version, rejection thresholds, fit residuals, conditioning, and extrapolation-stability checks.
 
-The sine-plus-line model is intended as a controlled substitution for the default `smooth` processing. It fits `A*sin(w*kx+phi) + C1*kx + C2` over the trusted interval, evaluates the model across the full readout, and does not apply the normal smoothing afterward. It cannot recover calibration information when the selected interval itself is aliased or contaminated.
+For a reproducible manual override, add both bounds:
+
+```text
+--psf-fit-kx-min 200
+--psf-fit-kx-max 512
+```
+
+Replace these example values with a high-fidelity interval identified from the calibration diagnostics. The interval is `[kx_min, kx_max)`. Providing only one bound is an error.
+
+The sine-plus-line model is an explicit alternative to the default `smooth` processing. It fits `A*sin(w*kx+phi) + C1*kx + C2` over the selected interval and evaluates the model across the full readout. Automatic mode smooths quality-masked samples before fitting; manual mode fits raw finite samples. The command fails rather than silently reverting to `smooth` when range selection or fit validation is inadequate. It cannot recover calibration information when the accepted support itself is aliased or contaminated.
 
 ## Reconstruction failed after ESPIRiT completed
 

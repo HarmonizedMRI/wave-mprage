@@ -181,9 +181,16 @@ The optional path fits each coefficient within one shared high-fidelity readout 
 A * sin(w * kx + phi) + C1 * kx + C2
 ```
 
-The fitted model is then evaluated over the complete oversampled readout. In this mode, the sine-plus-line model **replaces** the normal smoothing step; the fitted curves are not smoothed again.
+The fitted model is then evaluated over the complete oversampled readout and becomes the coefficient curve used to construct the calibrated PSF. The automatic and manual variants differ only in range selection and fit-input preprocessing:
 
-Use this option when the direct PSF coefficient fit is reliable over a central or otherwise trusted region but blows up, becomes discontinuous, or is contaminated outside that region. When both range arguments are omitted, the reconstruction automatically selects one contiguous interval shared by `a`, `b`, and `c` from the finite coefficient samples and the common sin/cos projection-fit support and residual quality:
+| Variant | Range | Fit input |
+|---|---|---|
+| Automatic | Omit both kx bounds | Common quality/stability-selected interval; quality-masked window-9 NaN-aware smoothing before sine-line fitting |
+| Manual override | Supply both kx bounds | Exact user-selected half-open interval fitted from the raw finite coefficients |
+
+Neither variant changes the default processing mode: users must explicitly select `--psf-coefficient-processing sine-line`. Automatic preprocessing is part of the sine-line fit and is not a fallback to the standalone `smooth` output path.
+
+Use this option when a sine-plus-linear coefficient model is scientifically appropriate, including when the direct coefficient estimates become noisy, discontinuous, or contaminated over part of the readout. When both range arguments are omitted, the reconstruction automatically selects one interval shared by `a`, `b`, and `c` from the coefficient stability and common sin/cos projection-fit quality:
 
 ```bash
 uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \

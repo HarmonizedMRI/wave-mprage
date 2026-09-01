@@ -179,6 +179,27 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
   --save-nifti-phase
 ```
 
+PSF coefficient processing remains `smooth` by default. To opt into the
+automatic sine-plus-line fit, select `sine-line` without supplying manual kx
+bounds:
+
+```bash
+uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
+  --twix /path/to/data/meas_integrated_wave_mprage.dat \
+  --seq /path/to/data/mprage_3d_flashcalib_wave.seq \
+  --out /path/to/output \
+  --wave-mode wave \
+  --psf-coefficient-processing sine-line
+```
+
+Automatic mode uses calibration quality and coefficient stability to choose
+one shared half-open fit interval for `a(kx)`, `b(kx)`, and `c(kx)`. It uses a
+near-global interval for stable data and a center-containing interval when it
+detects sustained coefficient corruption. Supply both `--psf-fit-kx-min` and
+`--psf-fit-kx-max` to override the automatic interval reproducibly. See
+[PSF coefficient processing](docs/reconstruction.md#psf-coefficient-processing)
+for the selection, validation, diagnostics, and failure contracts.
+
 Add `--save-bart-inputs` to export the calibrated PSF, coil-compressed
 k-space, sensitivity maps, and integrated ACS as BART CFL pairs. The companion
 `recon/bart/run_wave_recon.sh` script runs BART `ecalib` and `wave`; see
