@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,6 +41,26 @@ class BartIoTests(unittest.TestCase):
             self.assertEqual(_read_cfl(Path(folder) / "psf").shape, (8, 3, 2, 1, 1))
             self.assertEqual(_read_cfl(Path(folder) / "coil_sens").shape, (4, 3, 2, 2, 1))
             self.assertEqual(_read_cfl(Path(folder) / "kspace_calib").shape, (4, 3, 2, 2))
+
+    def test_records_optional_psf_calibration_provenance(self) -> None:
+        """The BART manifest should retain automatic PSF fit provenance."""
+
+        with tempfile.TemporaryDirectory() as folder:
+            manifest_path = export_wave_inputs(
+                folder,
+                wave_kspace=np.ones((8, 3, 2, 1, 2), np.complex64),
+                calibrated_psf=np.ones((1, 8, 3, 2), np.complex64),
+                coil_sens=np.ones((2, 4, 3, 2), np.complex64),
+                kspace_calib=np.ones((4, 3, 2, 2), np.complex64),
+                psf_calibration={
+                    "coefficient_processing": "sine-line",
+                    "kx_range": [12, 96],
+                    "kx_range_convention": "half-open [min, max)",
+                },
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(manifest["psf_calibration"]["kx_range"], [12, 96])
 
 
 if __name__ == "__main__":

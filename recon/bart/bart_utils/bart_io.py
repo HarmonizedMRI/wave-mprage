@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import numpy as np
 
@@ -87,8 +87,21 @@ def export_wave_inputs(
     calibrated_psf: np.ndarray,
     coil_sens: np.ndarray,
     kspace_calib: np.ndarray,
+    psf_calibration: Mapping[str, Any] | None = None,
 ) -> Path:
-    """Export reconstruction-native arrays for BART ``ecalib`` and ``wave``."""
+    """Export reconstruction-native arrays for BART ``ecalib`` and ``wave``.
+
+    Args:
+        out_folder: Destination directory for BART CFL pairs and manifest.
+        wave_kspace: Wave k-space in ``(wx, sy, sz, echo, coil)`` order.
+        calibrated_psf: Calibrated PSF in ``(echo, wx, sy, sz)`` order.
+        coil_sens: Coil maps in ``(coil, sx, sy, sz)`` order.
+        kspace_calib: Calibration k-space in ``(sx, sy, sz, coil)`` order.
+        psf_calibration: Optional JSON-compatible PSF processing provenance.
+
+    Returns:
+        Path to the generated JSON manifest.
+    """
 
     destination = Path(out_folder)
     destination.mkdir(parents=True, exist_ok=True)
@@ -141,6 +154,8 @@ def export_wave_inputs(
         "kspace_calib_shape": list(calib.shape),
         "echoes": files,
     }
+    if psf_calibration is not None:
+        manifest["psf_calibration"] = dict(psf_calibration)
     manifest_path = destination / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return manifest_path

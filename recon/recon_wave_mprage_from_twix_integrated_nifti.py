@@ -31,8 +31,6 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 from scipy import io
-from scipy.optimize import least_squares
-from scipy.signal import lombscargle
 import pypulseq as pp
 
 import platform
@@ -61,6 +59,12 @@ from utils.espirit_calibration import estimate_espirit_maps
 
 from utils.psf_wrapped_phase_fit import fit_wrapped_phase_planes
 from utils.psf_wrapped_phase_fit import smooth_1d_nan
+from utils.psf_coefficient_processing import (
+    AUTO_FIT_PREFILTER_WINDOW,
+    fit_sine_plus_line,
+    select_automatic_kx_range,
+    sine_line_model,
+)
 
 from utils.wave_cg_sense_precondition import cg_sense_wave, fft3call, ifft3call, fftc_dim, ifftc_dim
 
@@ -217,7 +221,7 @@ def main():
         y_meas = kspace_cc_echo.permute(3, 0, 1, 2)  # (ncoil, Nx_os, Ny, Nz)
 
         print("Generating calibrated PSF from integrated refscan calibration blocks...")
-        psf_calib, psf_theory = generate_calibrated_psf(
+        psf_calib, psf_theory, psf_processing_diagnostics = generate_calibrated_psf(
             mprage_data_file=mprage_data_file,
             mprage_seq_file=mprage_seq_file,
             out_folder=out_folder,
@@ -233,7 +237,9 @@ def main():
             coefficient_processing=psf_coefficient_processing,
             fit_kx_min=psf_fit_kx_min,
             fit_kx_max=psf_fit_kx_max,
+            return_diagnostics=True,
         )
+        resolved_psf_fit_kx_range = psf_processing_diagnostics.get("kx_range")
         print("Generated calibrated PSF")
 
         if save_bart_inputs:
@@ -256,6 +262,7 @@ def main():
                 calibrated_psf=psf_calib.unsqueeze(0).numpy(),
                 coil_sens=csm_full_cc_np,
                 kspace_calib=kspace_calib,
+                psf_calibration=psf_processing_diagnostics,
             )
             print(f"Saved BART Wave-CAIPI inputs: {manifest_path}")
 
@@ -312,7 +319,8 @@ def main():
                     voxel_size_mm=nifti_voxel_size_mm,
                     geometry_diagnostics=geometry_diagnostics,
                     psf_coefficient_processing=psf_coefficient_processing,
-                    psf_fit_kx_range=(psf_fit_kx_min, psf_fit_kx_max),
+                    psf_fit_kx_range=resolved_psf_fit_kx_range,
+                    psf_processing_diagnostics=psf_processing_diagnostics,
                 ),
             )
 
@@ -590,8 +598,31 @@ def _build_mprage_nifti_metadata(
     geometry_diagnostics=None,
     psf_coefficient_processing=None,
     psf_fit_kx_range=None,
+    psf_processing_diagnostics=None,
 ):
-    """Create metadata without feeding sidecar values back into reconstruction."""
+    """Create MPRAGE sidecar metadata without changing reconstruction inputs.
+
+    Args:
+        tag_wave: Resolved ``wave`` or ``nowave`` acquisition mode.
+        file_tag: User-provided output tag.
+        defs: Pulseq sequence definitions.
+        geom: Resolved logical and physical geometry.
+        os_factor: Readout oversampling factor.
+        Ry: LIN acceleration factor.
+        Rz: PAR acceleration factor.
+        ncalib: Projection-calibration line count.
+        nacs: Integrated ACS width.
+        yflip: LIN PSF sign convention.
+        zflip: PAR PSF sign convention.
+        voxel_size_mm: Logical output voxel sizes in millimeters.
+        geometry_diagnostics: Optional TWIX/Pulseq geometry checks.
+        psf_coefficient_processing: PSF coefficient processing mode.
+        psf_fit_kx_range: Selected half-open sine-line fit range.
+        psf_processing_diagnostics: Optional full PSF fit provenance.
+
+    Returns:
+        JSON-compatible NIfTI sidecar metadata.
+    """
     metadata = {
         "Modality": "MR",
         "PulseSequenceType": "MPRAGE",
@@ -697,6 +728,8 @@ def _build_mprage_nifti_metadata(
             metadata["PSFFitKxRange"] = [int(psf_fit_kx_range[0]), int(psf_fit_kx_range[1])]
             metadata["PSFFitKxRangeConvention"] = "half-open [min, max)"
             metadata["PSFFitModel"] = "A*sin(w*kx+phi)+C1*kx+C2"
+        if psf_processing_diagnostics is not None:
+            metadata["PSFCoefficientProcessingDiagnostics"] = psf_processing_diagnostics
     return metadata
 
 
@@ -1173,10 +1206,72 @@ def _resolve_mprage_wave_mode(
     return requested_mode
 
 
+def _projection_fit_quality_summary(result):
+    """Summarize wrapped-plane fit quality on the readout grid.
+
+    Args:
+        result: Mapping returned by ``fit_wrapped_phase_planes`` with quality
+            maps enabled.
+
+    Returns:
+        Per-readout NumPy vectors describing support, residuals, skipped fits,
+        and median phase/residual coherence over the final fit mask.
+    """
+
+    mask = torch.as_tensor(result["mask"], dtype=torch.bool).detach().cpu()
+
+    def masked_median(values):
+        """Reduce a quality map over accepted pixels for each readout sample.
+
+        Args:
+            values: Readout-by-projection quality map.
+
+        Returns:
+            Per-readout median values over the final wrapped-plane fit mask.
+        """
+
+        array = torch.as_tensor(values).detach().cpu()
+        medians = np.full(mask.shape[0], np.nan, dtype=np.float64)
+        for index in range(mask.shape[0]):
+            selected = array[index][mask[index]]
+            selected = selected[torch.isfinite(selected)]
+            if selected.numel():
+                medians[index] = float(torch.median(selected).item())
+        return medians
+
+    summary = {
+        name: torch.as_tensor(result[name]).detach().cpu().numpy()
+        for name in ("wrapped_rms", "valid_pixels", "masked_ratio", "skipped")
+    }
+    summary["median_phase_coherence"] = masked_median(result["phase_coherence"])
+    summary["median_residual_coherence"] = masked_median(result["residual_coherence"])
+    return summary
+
+
 def fit_wave_psf_deviation_from_projection(mprage_data_file, mprage_seq_file, out_folder, file_tag,
                                            yflip=1, zflip=1, Ncalib=72, Nacs=32,
-                                           slice_orientation='SAG'):
-    """Fit PSF deviation from integrated refscan projection calibration blocks."""
+                                           slice_orientation='SAG', return_diagnostics=False):
+    """Fit PSF deviation from integrated refscan projection calibration blocks.
+
+    Args:
+        mprage_data_file: Integrated Siemens TWIX file; only its refscan stream
+            is loaded by this function.
+        mprage_seq_file: Matching integrated Pulseq sequence file.
+        out_folder: Directory prefix for raw fitted coefficient arrays.
+        file_tag: Filename tag for saved coefficient arrays.
+        yflip: LIN Wave trajectory sign.
+        zflip: PAR Wave trajectory sign.
+        Ncalib: Projection-calibration line count.
+        Nacs: Integrated ACS width.
+        slice_orientation: Supported sequence orientation.
+        return_diagnostics: Return structured projection quality in addition
+            to the backward-compatible coefficient tuple.
+
+    Returns:
+        Raw ``a``, ``b``, ``c`` vectors and calibration ADC sample count. When
+        ``return_diagnostics`` is true, a fifth structured evidence mapping is
+        appended.
+    """
     data_ref = load_ref(mprage_data_file)
     _check_integrated_refscan_shape(data_ref, Nacs=Nacs, Ncalib=Ncalib)
     Nx_os, _, _, _, Ncoil = data_ref.shape
@@ -1199,7 +1294,7 @@ def fit_wave_psf_deviation_from_projection(mprage_data_file, mprage_seq_file, ou
     a_fit_all = []
     b_fit_all = []
     c_fit_all = []
-    mask_all = []
+    projection_quality = {}
 
     # Integrated refscan set convention:
     #   set 0: nowave sin projection
@@ -1273,7 +1368,7 @@ def fit_wave_psf_deviation_from_projection(mprage_data_file, mprage_seq_file, ou
         a_fit_all.append(result["a_fit_all"])
         b_fit_all.append(result["b_fit_all"])
         c_fit_all.append(result["c_fit_all"])
-        mask_all.append(result["mask"])
+        projection_quality[wave_mode] = _projection_fit_quality_summary(result)
 
         if wave_mode == 'sin':
             tag = f'projy_{Ncalib}kyline'
@@ -1289,91 +1384,50 @@ def fit_wave_psf_deviation_from_projection(mprage_data_file, mprage_seq_file, ou
     b_fit = b_fit_all[1]
     c_fit = c_fit_all[0] + c_fit_all[1]
 
+    if return_diagnostics:
+        evidence = {
+            "readout_index": np.arange(Nx_os, dtype=np.int64),
+            "projection_quality": projection_quality,
+            "component_projection_sources": {
+                "a": ["sin"],
+                "b": ["cos"],
+                "c": ["sin", "cos"],
+            },
+        }
+        return a_fit, b_fit, c_fit, Nacs_total, evidence
     return a_fit, b_fit, c_fit, Nacs_total
 
 
 def _sine_line_model(t, A, w, phi, C1, C2):
-    """Evaluate A*sin(w*t + phi) + C1*t + C2."""
-    return A * np.sin(w * t + phi) + C1 * t + C2
+    """Evaluate A*sin(w*t + phi) + C1*t + C2.
+
+    Args:
+        t: Readout sample coordinates.
+        A: Sine amplitude.
+        w: Angular frequency in radians per sample.
+        phi: Sine phase at readout index zero.
+        C1: Linear slope.
+        C2: Linear intercept.
+
+    Returns:
+        Model values at ``t``.
+    """
+
+    return sine_line_model(t, A, w, phi, C1, C2)
 
 
 def _fit_sine_plus_line(t, values):
-    """Fit a sine plus linear trend to finite samples in one coefficient."""
-    t = np.asarray(t, dtype=float).ravel()
-    values = np.asarray(values, dtype=float).ravel()
-    valid = np.isfinite(t) & np.isfinite(values)
-    t = t[valid]
-    values = values[valid]
-    if t.size < 6:
-        raise ValueError("At least 6 finite coefficient samples are required for sine-line PSF processing.")
-    order = np.argsort(t)
-    t = t[order]
-    values = values[order]
-    if np.ptp(t) == 0:
-        raise ValueError("PSF fit kx coordinates must contain more than one distinct value.")
+    """Fit one coefficient with the shared sine-plus-line implementation.
 
-    t_ref = float(np.mean(t))
-    x = t - t_ref
-    span = float(np.ptp(x))
-    unique_dt = np.diff(np.unique(t))
-    median_dt = float(np.median(unique_dt))
-    w_min = 2.0 * np.pi / span
-    w_max = np.pi / median_dt
+    Args:
+        t: Readout sample coordinates.
+        values: Raw coefficient samples.
 
-    C1_initial, C2_ref_initial = np.polyfit(x, values, 1)
-    detrended = values - (C1_initial * x + C2_ref_initial)
-    detrended -= np.mean(detrended)
-    w_grid = np.linspace(w_min, w_max, 10000)
-    power = lombscargle(x, detrended, w_grid, precenter=False, normalize=True)
-    w_initial = float(w_grid[int(np.argmax(power))])
+    Returns:
+        Fitted parameters and numerical diagnostics.
+    """
 
-    design = np.column_stack([
-        np.sin(w_initial * x),
-        np.cos(w_initial * x),
-        x,
-        np.ones_like(x),
-    ])
-    sine_coef, cosine_coef, C1_initial, C2_ref_initial = np.linalg.lstsq(
-        design, values, rcond=None
-    )[0]
-    A_initial = float(np.hypot(sine_coef, cosine_coef))
-    phi_ref_initial = float(np.arctan2(cosine_coef, sine_coef))
-    initial = np.array([
-        max(A_initial, np.finfo(float).eps),
-        w_initial,
-        phi_ref_initial,
-        C1_initial,
-        C2_ref_initial,
-    ])
-
-    def residuals(parameters):
-        A, w, phi_ref, C1, C2_ref = parameters
-        return A * np.sin(w * x + phi_ref) + C1 * x + C2_ref - values
-
-    result = least_squares(
-        residuals,
-        initial,
-        bounds=(
-            [0.0, w_min, -np.inf, -np.inf, -np.inf],
-            [np.inf, w_max, np.inf, np.inf, np.inf],
-        ),
-        method="trf",
-        x_scale="jac",
-        loss="linear",
-    )
-    A, w, phi_ref, C1, C2_ref = result.x
-    phi = (phi_ref - w * t_ref + np.pi) % (2.0 * np.pi) - np.pi
-    C2 = C2_ref - C1 * t_ref
-    return {
-        "A": float(A),
-        "w": float(w),
-        "phi": float(phi),
-        "C1": float(C1),
-        "C2": float(C2),
-        "success": bool(result.success),
-        "message": str(result.message),
-        "n_samples": int(t.size),
-    }
+    return fit_sine_plus_line(t, values)
 
 
 def _process_psf_coefficients(
@@ -1384,33 +1438,94 @@ def _process_psf_coefficients(
     coefficient_processing="smooth",
     fit_kx_min=None,
     fit_kx_max=None,
+    fit_quality=None,
     out_folder=None,
     file_tag="",
+    return_diagnostics=False,
 ):
-    """Apply mutually exclusive smoothing or sine-line coefficient processing."""
+    """Apply mutually exclusive smoothing or sine-line coefficient processing.
+
+    Args:
+        a_raw: Raw LIN phase coefficient vector.
+        b_raw: Raw PAR phase coefficient vector.
+        c_raw: Raw constant phase coefficient vector.
+        Nx_os: Oversampled readout length.
+        coefficient_processing: ``smooth`` or ``sine-line``.
+        fit_kx_min: Optional inclusive manual range start.
+        fit_kx_max: Optional exclusive manual range stop.
+        fit_quality: Sin/cos projection evidence used for automatic selection.
+        out_folder: Optional diagnostics destination.
+        file_tag: Diagnostics filename tag.
+        return_diagnostics: Append processing diagnostics to the output tuple.
+
+    Returns:
+        Processed ``a``, ``b``, and ``c`` tensors, optionally followed by a
+        JSON-compatible diagnostics mapping.
+    """
+
     mode = str(coefficient_processing).strip().lower()
     if mode == "smooth":
-        return (
+        outputs = (
             smooth_1d_nan(a_raw, window=9),
             smooth_1d_nan(b_raw, window=9),
             smooth_1d_nan(c_raw, window=9),
         )
+        diagnostics = {
+            "coefficient_processing": "smooth",
+            "fit_range_selection": None,
+            "kx_range": None,
+            "kx_range_convention": "half-open [min, max)",
+        }
+        return (*outputs, diagnostics) if return_diagnostics else outputs
     if mode != "sine-line":
         raise ValueError("coefficient_processing must be 'smooth' or 'sine-line'.")
-    if fit_kx_min is None or fit_kx_max is None:
-        raise ValueError("sine-line PSF processing requires fit_kx_min and fit_kx_max.")
-    fit_kx_min = int(fit_kx_min)
-    fit_kx_max = int(fit_kx_max)
+    if (fit_kx_min is None) != (fit_kx_max is None):
+        raise ValueError("sine-line PSF processing requires both manual fit bounds or neither.")
+    if fit_kx_min is None:
+        if fit_quality is None:
+            raise ValueError(
+                "automatic sine-line PSF processing requires projection fit quality evidence."
+            )
+        selected, selection_diagnostics = select_automatic_kx_range(
+            (a_raw, b_raw, c_raw), fit_quality
+        )
+        fit_kx_min, fit_kx_max = selected
+        fit_sample_mask = np.asarray(
+            selection_diagnostics.pop("_fit_sample_mask"), dtype=bool
+        )
+        fit_range_selection = "automatic"
+    else:
+        fit_kx_min = int(fit_kx_min)
+        fit_kx_max = int(fit_kx_max)
+        fit_range_selection = "manual"
+        selection_diagnostics = {
+            "name": "manual-half-open-range",
+            "version": 1,
+            "selected_interval": [fit_kx_min, fit_kx_max],
+        }
+        fit_sample_mask = np.ones(int(Nx_os), dtype=bool)
     if not (0 <= fit_kx_min < fit_kx_max <= int(Nx_os)):
         raise ValueError(
             f"PSF fit range must satisfy 0 <= min < max <= Nx_os; got "
             f"[{fit_kx_min}, {fit_kx_max}) with Nx_os={Nx_os}."
         )
 
-    kx_fit = np.arange(fit_kx_min, fit_kx_max, dtype=float)
+    interval_width = fit_kx_max - fit_kx_min
     kx_all = np.arange(int(Nx_os), dtype=float)
+    fit_indices = np.flatnonzero(fit_sample_mask)
+    fit_indices = fit_indices[
+        (fit_indices >= fit_kx_min) & (fit_indices < fit_kx_max)
+    ]
+    if fit_range_selection == "automatic":
+        fit_input_processing = {
+            "name": "quality-masked-nan-aware-moving-average",
+            "window_samples": AUTO_FIT_PREFILTER_WINDOW,
+        }
+    else:
+        fit_input_processing = {"name": "raw", "window_samples": None}
     outputs = []
     diagnostics = {}
+    validation_passed = True
     for name, raw in (("a", a_raw), ("b", b_raw), ("c", c_raw)):
         # Keep this branch tensor-native so dtype/device information remains
         # available when the full fitted curve is converted back to PyTorch.
@@ -1420,10 +1535,29 @@ def _process_psf_coefficients(
                 f"{name}_raw should reduce to a 1D vector after squeeze; "
                 f"got shape {tuple(raw_1d.shape)}"
             )
+        if raw_1d.numel() != int(Nx_os):
+            raise ValueError(
+                f"{name}_raw has {raw_1d.numel()} samples; expected Nx_os={Nx_os}."
+            )
+        fit_indices_tensor = torch.as_tensor(
+            fit_indices, dtype=torch.long, device=raw_1d.device
+        )
+        if fit_range_selection == "automatic":
+            fit_mask_tensor = torch.as_tensor(
+                fit_sample_mask, dtype=torch.bool, device=raw_1d.device
+            )
+            masked_raw = raw_1d.clone()
+            masked_raw[~fit_mask_tensor] = torch.nan
+            fit_input_1d = smooth_1d_nan(
+                masked_raw,
+                window=AUTO_FIT_PREFILTER_WINDOW,
+            )
+        else:
+            fit_input_1d = raw_1d
 
         params = _fit_sine_plus_line(
-            kx_fit,
-            raw_1d[fit_kx_min:fit_kx_max].cpu().numpy(),
+            fit_indices.astype(float),
+            fit_input_1d[fit_indices_tensor].cpu().numpy(),
         )
         fitted = _sine_line_model(
             kx_all,
@@ -1433,7 +1567,103 @@ def _process_psf_coefficients(
             params["C1"],
             params["C2"],
         )
+        raw_fit_values = raw_1d[fit_indices_tensor].cpu().numpy()
+        raw_fit_prediction = _sine_line_model(
+            fit_indices.astype(float),
+            params["A"],
+            params["w"],
+            params["phi"],
+            params["C1"],
+            params["C2"],
+        )
+        raw_residual = raw_fit_prediction - raw_fit_values
+        params["raw_observation_residual_rmse"] = float(
+            np.sqrt(np.mean(raw_residual**2))
+        )
+        params["raw_observation_residual_rmse_relative_to_range"] = float(
+            np.sqrt(np.mean(raw_residual**2))
+            / max(float(np.ptp(raw_fit_values)), np.finfo(float).eps)
+        )
+        params["fit_input_processing"] = fit_input_processing
         outputs.append(torch.as_tensor(fitted, dtype=raw_1d.dtype, device=raw_1d.device))
+        trim = max(2, int(np.ceil(0.05 * interval_width)))
+        stability = {
+            "trim_samples_per_side": trim,
+            "refit_success": False,
+            "refit_standardized_jacobian_condition_number": None,
+            "full_readout_relative_l2_difference": None,
+            "full_readout_max_difference_relative_to_fit_range": None,
+        }
+        trimmed_indices = fit_indices[
+            (fit_indices >= fit_kx_min + trim)
+            & (fit_indices < fit_kx_max - trim)
+        ]
+        if trimmed_indices.size >= 6:
+            try:
+                trimmed_indices_tensor = torch.as_tensor(
+                    trimmed_indices, dtype=torch.long, device=raw_1d.device
+                )
+                trimmed_params = _fit_sine_plus_line(
+                    trimmed_indices.astype(float),
+                    fit_input_1d[trimmed_indices_tensor].cpu().numpy(),
+                )
+                trimmed_fitted = _sine_line_model(
+                    kx_all,
+                    trimmed_params["A"],
+                    trimmed_params["w"],
+                    trimmed_params["phi"],
+                    trimmed_params["C1"],
+                    trimmed_params["C2"],
+                )
+                difference = fitted - trimmed_fitted
+                fit_values = fit_input_1d[fit_indices_tensor].cpu().numpy()
+                stability.update(
+                    {
+                        "refit_success": bool(
+                            trimmed_params["success"]
+                            and np.isfinite(
+                                trimmed_params["standardized_jacobian_condition_number"]
+                            )
+                            and trimmed_params["standardized_jacobian_condition_number"]
+                            <= 1.0e12
+                        ),
+                        "refit_standardized_jacobian_condition_number": trimmed_params[
+                            "standardized_jacobian_condition_number"
+                        ],
+                        "full_readout_relative_l2_difference": float(
+                            np.linalg.norm(difference)
+                            / max(np.linalg.norm(fitted), np.finfo(float).eps)
+                        ),
+                        "full_readout_max_difference_relative_to_fit_range": float(
+                            np.max(np.abs(difference))
+                            / max(float(np.ptp(fit_values)), np.finfo(float).eps)
+                        ),
+                    }
+                )
+            except ValueError as exc:
+                stability["error"] = str(exc)
+        gates = {
+            "optimizer_converged": bool(params["success"]),
+            "condition_number_at_most_1e12": bool(
+                params["standardized_jacobian_condition_number"] <= 1.0e12
+            ),
+            "residual_rmse_relative_to_range_at_most_0p5": bool(
+                params["residual_rmse_relative_to_range"] <= 0.5
+            ),
+            "period_at_least_4_samples": bool(params["period_samples"] >= 4.0),
+            "frequency_not_on_search_boundary": bool(
+                params["frequency_boundary_fraction"] >= 0.005
+            ),
+            "endpoint_trim_refit_succeeded": bool(stability["refit_success"]),
+            "endpoint_trim_full_readout_relative_l2_at_most_1": bool(
+                stability["full_readout_relative_l2_difference"] is not None
+                and stability["full_readout_relative_l2_difference"] <= 1.0
+            ),
+        }
+        params["endpoint_trim_stability"] = stability
+        params["validation_gates"] = gates
+        params["validation_passed"] = all(gates.values())
+        validation_passed &= params["validation_passed"]
         diagnostics[name] = params
 
     if out_folder is not None:
@@ -1443,21 +1673,74 @@ def _process_psf_coefficients(
                 {
                     "model": "A*sin(w*kx+phi)+C1*kx+C2",
                     "kx_range": [fit_kx_min, fit_kx_max],
-                    "kx_range_convention": "half-open",
+                    "kx_range_convention": "half-open [min, max)",
+                    "fit_range_selection": fit_range_selection,
+                    "fit_input_processing": fit_input_processing,
+                    "range_selection_diagnostics": selection_diagnostics,
                     "coefficients": diagnostics,
+                    "validation_passed": validation_passed,
                 },
                 f,
                 indent=2,
             )
         print(f"Saved sine-line PSF fit diagnostics: {diag_path}")
-    return tuple(outputs)
+    processing_diagnostics = {
+        "coefficient_processing": "sine-line",
+        "model": "A*sin(w*kx+phi)+C1*kx+C2",
+        "fit_range_selection": fit_range_selection,
+        "fit_input_processing": fit_input_processing,
+        "kx_range": [fit_kx_min, fit_kx_max],
+        "kx_range_convention": "half-open [min, max)",
+        "range_selection_diagnostics": selection_diagnostics,
+        "coefficients": diagnostics,
+        "validation_passed": validation_passed,
+    }
+    if fit_range_selection == "automatic" and not validation_passed:
+        raise ValueError(
+            "Automatic sine-line PSF fitting failed one or more numerical or "
+            "extrapolation-stability gates; inspect the saved fit diagnostics."
+        )
+    return (*outputs, processing_diagnostics) if return_diagnostics else tuple(outputs)
 
 def generate_calibrated_psf(mprage_data_file, mprage_seq_file, out_folder, Nx_os, Ny, Nz, file_tag,
                             yflip=-1, zflip=-1, Ncalib=72, Nacs=32,
                             slice_orientation='SAG', psf_plot=True,
-                            coefficient_processing='smooth', fit_kx_min=None, fit_kx_max=None):
-    """Generate calibrated wave PSF from the integrated calibration module."""
-    a_fit_all, b_fit_all, c_fit_all, Nacs_total = fit_wave_psf_deviation_from_projection(
+                            coefficient_processing='smooth', fit_kx_min=None, fit_kx_max=None,
+                            return_diagnostics=False):
+    """Generate a calibrated Wave PSF from the integrated calibration module.
+
+    Args:
+        mprage_data_file: Integrated Siemens TWIX file; only its refscan stream
+            is read for PSF calibration.
+        mprage_seq_file: Matching integrated Pulseq sequence file.
+        out_folder: Diagnostics output directory prefix.
+        Nx_os: Oversampled readout length.
+        Ny: Target logical LIN matrix.
+        Nz: Target logical PAR matrix.
+        file_tag: Output filename tag.
+        yflip: LIN trajectory sign.
+        zflip: PAR trajectory sign.
+        Ncalib: Projection-calibration line count.
+        Nacs: Integrated ACS width.
+        slice_orientation: Supported acquisition orientation.
+        psf_plot: Save a processed-coefficient plot when true.
+        coefficient_processing: ``smooth`` or ``sine-line``.
+        fit_kx_min: Optional inclusive manual sine-line range start.
+        fit_kx_max: Optional exclusive manual sine-line range stop.
+        return_diagnostics: Append coefficient-processing diagnostics.
+
+    Returns:
+        Calibrated and theoretical PSF tensors, optionally followed by the
+        processing diagnostics mapping.
+    """
+
+    (
+        a_fit_all,
+        b_fit_all,
+        c_fit_all,
+        Nacs_total,
+        calibration_evidence,
+    ) = fit_wave_psf_deviation_from_projection(
         mprage_data_file=mprage_data_file,
         mprage_seq_file=mprage_seq_file,
         out_folder=out_folder,
@@ -1467,9 +1750,10 @@ def generate_calibrated_psf(mprage_data_file, mprage_seq_file, out_folder, Nx_os
         Ncalib=Ncalib,
         Nacs=Nacs,
         slice_orientation=slice_orientation,
+        return_diagnostics=True,
     )
 
-    a_smooth, b_smooth, c_smooth = _process_psf_coefficients(
+    a_smooth, b_smooth, c_smooth, processing_diagnostics = _process_psf_coefficients(
         a_fit_all,
         b_fit_all,
         c_fit_all,
@@ -1477,8 +1761,10 @@ def generate_calibrated_psf(mprage_data_file, mprage_seq_file, out_folder, Nx_os
         coefficient_processing=coefficient_processing,
         fit_kx_min=fit_kx_min,
         fit_kx_max=fit_kx_max,
+        fit_quality=calibration_evidence["projection_quality"],
         out_folder=out_folder,
         file_tag=file_tag,
+        return_diagnostics=True,
     )
 
     a_fit = _squeeze_fit_vector(a_smooth, name='a_smooth')
@@ -1486,20 +1772,45 @@ def generate_calibrated_psf(mprage_data_file, mprage_seq_file, out_folder, Nx_os
     c_fit = _squeeze_fit_vector(c_smooth, name='c_smooth')
 
     if psf_plot:
-        plt.figure(figsize=(6, 4))
-        plt.plot(a_fit, label="a(t)")
-        plt.plot(b_fit, label="b(t)")
-        plt.plot(c_fit, label="c(t)")
-        plt.axvline(a_fit.shape[-1] // 2, linestyle='--', color='k')
-        plt.axhline(0, linestyle='--', color='k')
-        plt.legend()
-        plt.ylim([-3, 3])
-        plt.xlim([0, Nx_os])
-        plt.title(f'Integrated PSF calibration fit ({coefficient_processing})')
+        raw_coefficients = [
+            torch.as_tensor(raw).detach().cpu().squeeze().numpy()
+            for raw in (a_fit_all, b_fit_all, c_fit_all)
+        ]
+        processed_coefficients = [
+            torch.as_tensor(processed).detach().cpu().numpy()
+            for processed in (a_fit, b_fit, c_fit)
+        ]
+        figure, axes = plt.subplots(3, 1, figsize=(8, 7), sharex=True)
+        selected_range = processing_diagnostics.get("kx_range")
+        for axis, name, raw, processed in zip(
+            axes,
+            ("a", "b", "c"),
+            raw_coefficients,
+            processed_coefficients,
+            strict=True,
+        ):
+            axis.plot(raw, ".", markersize=2, alpha=0.45, label=f"raw {name}")
+            axis.plot(processed, linewidth=1.5, label=f"processed {name}")
+            if selected_range is not None:
+                axis.axvspan(
+                    int(selected_range[0]),
+                    int(selected_range[1]),
+                    alpha=0.12,
+                    label=f"{processing_diagnostics['fit_range_selection']} fit region",
+                )
+            axis.axvline(Nx_os // 2, linestyle="--", color="k", label="readout center")
+            axis.axhline(0, linestyle=":", color="k")
+            axis.set_ylabel(name)
+            axis.set_ylim([-3, 3])
+            axis.legend(loc="best", fontsize="small")
+        axes[-1].set_xlim([0, Nx_os])
+        axes[-1].set_xlabel("oversampled readout index kx")
+        figure.suptitle(f'Integrated PSF calibration fit ({coefficient_processing})')
+        figure.tight_layout()
         fig_path = out_folder + 'psf_integrated_calib_fit_' + file_tag + '.png'
         print(f"Saving PSF calibration fit plot to: {fig_path}")
-        plt.savefig(fig_path)
-        plt.close('all')
+        figure.savefig(fig_path, dpi=150)
+        plt.close(figure)
 
     # generate theoretical psf on the final [Ny, Nz] grid
     delta_ky_idx, delta_kz_idx = generate_theoretical_wave_trajectory(
@@ -1543,6 +1854,8 @@ def generate_calibrated_psf(mprage_data_file, mprage_seq_file, out_folder, Nx_os
 
     psf_diff_pred_new = torch.nan_to_num(psf_diff_pred_new.clone(), nan=0.0)
     psf_calib = psf_theory * torch.exp(1j * psf_diff_pred_new)
+    if return_diagnostics:
+        return psf_calib, psf_theory, processing_diagnostics
     return psf_calib, psf_theory
 
 
@@ -1698,13 +2011,19 @@ def _parse_cli_args():
         "--psf-fit-kx-min",
         type=int,
         default=None,
-        help="Inclusive first oversampled-readout index for sine-line PSF fitting.",
+        help=(
+            "Inclusive first oversampled-readout index for a manual sine-line fit. "
+            "Omit both fit bounds to select the interval automatically."
+        ),
     )
     parser.add_argument(
         "--psf-fit-kx-max",
         type=int,
         default=None,
-        help="Exclusive final oversampled-readout index for sine-line PSF fitting.",
+        help=(
+            "Exclusive final oversampled-readout index for a manual sine-line fit. "
+            "Omit both fit bounds to select the interval automatically."
+        ),
     )
 
     return parser.parse_args()
@@ -1949,12 +2268,15 @@ def _collect_runtime_config():
     psf_fit_kx_min_value = cli.psf_fit_kx_min
     psf_fit_kx_max_value = cli.psf_fit_kx_max
     if psf_coefficient_processing_value == "sine-line":
-        if psf_fit_kx_min_value is None or psf_fit_kx_max_value is None:
+        if (psf_fit_kx_min_value is None) != (psf_fit_kx_max_value is None):
             raise ValueError(
-                "--psf-coefficient-processing sine-line requires both "
-                "--psf-fit-kx-min and --psf-fit-kx-max."
+                "Manual sine-line fitting requires both --psf-fit-kx-min and "
+                "--psf-fit-kx-max; omit both to use automatic range selection."
             )
-        if psf_fit_kx_min_value < 0 or psf_fit_kx_max_value <= psf_fit_kx_min_value:
+        if (
+            psf_fit_kx_min_value is not None
+            and (psf_fit_kx_min_value < 0 or psf_fit_kx_max_value <= psf_fit_kx_min_value)
+        ):
             raise ValueError(
                 "PSF fit indices must satisfy 0 <= --psf-fit-kx-min < --psf-fit-kx-max."
             )

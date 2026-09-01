@@ -175,7 +175,7 @@ The default path applies NaN-aware one-dimensional smoothing to the directly est
 
 ### `sine-line`
 
-The optional path fits each coefficient within a user-selected high-fidelity readout interval to:
+The optional path fits each coefficient within one shared high-fidelity readout interval to:
 
 ```text
 A * sin(w * kx + phi) + C1 * kx + C2
@@ -183,7 +183,20 @@ A * sin(w * kx + phi) + C1 * kx + C2
 
 The fitted model is then evaluated over the complete oversampled readout. In this mode, the sine-plus-line model **replaces** the normal smoothing step; the fitted curves are not smoothed again.
 
-Use this option when the direct PSF coefficient fit is reliable over a central or otherwise trusted region but blows up, becomes discontinuous, or is contaminated outside that region. Both range arguments are required:
+Use this option when the direct PSF coefficient fit is reliable over a central or otherwise trusted region but blows up, becomes discontinuous, or is contaminated outside that region. When both range arguments are omitted, the reconstruction automatically selects one contiguous interval shared by `a`, `b`, and `c` from the finite coefficient samples and the common sin/cos projection-fit support and residual quality:
+
+```bash
+uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
+  --twix /path/to/data/meas_integrated_wave_mprage.dat \
+  --seq /path/to/data/mprage_3d_flashcalib_wave.seq \
+  --out /path/to/output \
+  --wave-mode wave \
+  --psf-coefficient-processing sine-line
+```
+
+Automatic selection uses the versioned `psf-sine-line-auto-range` algorithm. Version 9 requires at least 75% reliable common support in the central 80-sample coordinate span. When the raw coefficients contain no sustained internal blow-up or discontinuity, it fits almost the complete readout after excluding the 2% edge guards. A sustained coefficient-corruption region at least 5% of the readout long instead triggers selection of the stable contiguous region containing the center. Corruption detection uses the middle 20% of each smoothed coefficient to establish maximum-slope and local-variance reference limits; samples with excessive post-smoothing slope or variance are rejected before nonlinear fitting. Unreliable samples inside either coordinate interval remain excluded from all three regressions. The retained coefficient samples are processed with the existing window-9 NaN-aware smoother and the sine-plus-line model is fitted to those smoothed values. The nonlinear optimizer is capped at 500 function evaluations so malformed inputs fail rather than stall indefinitely. The selector also excludes non-finite coefficients, skipped wrapped-plane fits, low calibration support, and high wrapped residuals. It fails when center support, accepted sample count, overall interval support, or fit validation is inadequate; it never silently falls back to the standalone smooth processing mode.
+
+For a reproducible manual override, provide both range arguments:
 
 ```text
 --psf-fit-kx-min INTEGER
@@ -209,7 +222,7 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
   --psf-fit-kx-max 512
 ```
 
-Choose the high-fidelity interval from the saved coefficient and PSF diagnostic plots. It should exclude visibly corrupted readout regions while retaining enough finite samples and oscillatory structure for a stable fit. The script reports an error when `sine-line` is selected without both bounds.
+Choose a manual high-fidelity interval from the saved coefficient and PSF diagnostic plots. It should exclude visibly corrupted readout regions while retaining enough finite samples and oscillatory structure for a stable fit. Providing only one bound is an error. The selected interval, selection method, automatic algorithm/version, quality thresholds, and nonlinear-fit diagnostics are saved in `psf_sine_line_fit_<tag>.json`. The same provenance is included in exported BART manifests and Wave NIfTI sidecars. The coefficient plot overlays raw samples and processed curves for `a`, `b`, and `c` and marks both the readout center and selected fit interval.
 
 ## CPU and GPU behavior
 
