@@ -97,12 +97,12 @@ When the coil-compression matrix and full-resolution ESPIRiT sensitivity maps we
 Use the same `--out` directory, `--file-tag`, and `--espirit-calib-mode`. The script uses:
 
 ```text
-coil_compression_energy_<tag>.npy
-csm_full_<tag>.npy                         # native 3d
-csm_full_slice2d_sagmask_<tag>.npy         # SAG slice2d with RO support guard
+coil_compression_energy_roimgcrop_<tag>.npy
+csm_full_roimgcrop_<tag>.npy                         # native 3d
+csm_full_slice2d_sagmask_roimgcrop_<tag>.npy         # SAG slice2d
 ```
 
-The supported option is `--reuse-coil-calib` rather than `--reuse-exist-calib`. Reuse these files only when the TWIX measurement, receive-coil selection, geometry, ACS dimensions, oversampling, compression settings, reconstruction dimensions, calibration mode, and intended crop value are unchanged. A newly supplied `--espirit-crop` value is not reapplied to an existing cached map. If any relevant setting differs, rerun without the reuse option.
+The `roimgcrop` tag records that readout oversampling was removed by full-readout IFFT, central nominal-FOV image crop, and FFT. Legacy caches without this tag were derived from direct k-space striding and are intentionally not reused. The supported option is `--reuse-coil-calib` rather than `--reuse-exist-calib`. Reuse corrected files only when the TWIX measurement, receive-coil selection, geometry, ACS dimensions, oversampling, compression settings, reconstruction dimensions, calibration mode, and intended crop value are unchanged. A newly supplied `--espirit-crop` value is not reapplied to an existing cached map. If any relevant setting differs, rerun without the reuse option.
 
 ## Residual wave aliasing or contaminated PSF calibration
 
@@ -199,7 +199,7 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
   --espirit-crop 0.8
 ```
 
-The implementation removes readout oversampling before transforming logical RO to hybrid space. Do not apply the slice-wise method directly to the raw fourfold-oversampled RO array.
+The implementation removes readout oversampling with a centered IFFT-crop-FFT before transforming logical RO to hybrid space. Do not apply the slice-wise method directly to the raw fourfold-oversampled RO array, and do not replace this step with direct k-space striding because striding aliases outside-FOV signal into the nominal FOV.
 
 Native 3D remains the reference estimator. Compare representative 3D and slice2d results before adopting slice2d routinely. Reuse validated mode-specific calibration files with `--reuse-coil-calib` when appropriate.
 
@@ -438,8 +438,8 @@ The support decision is already embedded in the saved CSM. Do not use:
 when comparing support-mask settings. Delete the existing SAG slice2d CSM cache or use a new `--file-tag`:
 
 ```text
-csm_acs_slice2d_sagmask_<tag>.npy
-csm_full_slice2d_sagmask_<tag>.npy
+csm_acs_slice2d_sagmask_roimgcrop_<tag>.npy
+csm_full_slice2d_sagmask_roimgcrop_<tag>.npy
 ```
 
 The coil-compression matrix may remain reusable when all coil-compression inputs are unchanged, but the current reconstruction recomputes the calibration products together when cache reuse is disabled.
@@ -503,12 +503,12 @@ Regenerate the sequence after adding or changing those definitions.
 Delete or disable the cached files when geometry, readout oversampling, ACS size, receive coils, compression settings, ESPIRiT mode, or the intended crop value has changed:
 
 ```text
-coil_compression_energy_<tag>.npy
-csm_full_<tag>.npy                         # native 3d
-csm_full_slice2d_sagmask_<tag>.npy         # SAG slice2d with RO support guard
+coil_compression_energy_roimgcrop_<tag>.npy
+csm_full_roimgcrop_<tag>.npy                         # native 3d
+csm_full_slice2d_sagmask_roimgcrop_<tag>.npy         # SAG slice2d
 ```
 
-Then rerun without `--reuse-coil-calib`.
+Legacy files without `roimgcrop` are incompatible because direct k-space readout striding aliases the extended FOV. Leave them untouched for provenance, but rerun without `--reuse-coil-calib` to generate corrected caches.
 
 ## Memory errors
 

@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import numpy as np
+import torch
+
+RECON_ROOT = Path(__file__).resolve().parents[1]
+if str(RECON_ROOT) not in sys.path:
+    sys.path.insert(0, str(RECON_ROOT))
+os.environ.setdefault("MPLCONFIGDIR", tempfile.gettempdir())
+
+from recon import recon_wave_mprage_from_twix_integrated_nifti as reconstruction
+
+
+def _centered_fft(array: np.ndarray) -> np.ndarray:
+    """Return the centered orthonormal FFT along readout axis zero."""
+
+    return np.fft.fftshift(
+        np.fft.fft(
+            np.fft.ifftshift(array, axes=(0,)),
+            axis=0,
+            norm="ortho",
+        ),
+        axes=(0,),
+    )
+
+
+def _embed_center(array: np.ndarray, oversampling_factor: int) -> np.ndarray:
+    """Embed logical image data in the center of an oversampled readout FOV."""
+
+    shape = list(array.shape)
+    shape[0] *= oversampling_factor
+    embedded = np.zeros(shape, dtype=array.dtype)
+    start = shape[0] // 2 - array.shape[0] // 2
+    embedded[start : start + array.shape[0]] = array
+    return embedded
+
+
+class MprageCalibrationPipelineTests(unittest.TestCase):
+    """Verify integration of corrected ACS processing with BART export."""
+
+    def test_bart_calibration_uses_alias_free_logical_acs(self) -> None:
+        """The exporter should crop image RO before compression and padding."""
+
+        rng = np.random.default_rng(23)
+        logical_image = (
+            rng.standard_normal((4, 2, 2, 3))
+            + 1j * rng.standard_normal((4, 2, 2, 3))
+        ).astype(np.complex64)
+        oversampled_image = _embed_center(logical_image, 2)
+        oversampled_image[0] = 50.0
+        raw_acs = _centered_fft(oversampled_image).astype(np.complex64)
+        integrated_ref = torch.zeros((8, 2, 2, 5, 3), dtype=torch.complex64)
+        integrated_ref[:, :, :, -1, :] = torch.from_numpy(raw_acs)
+        compression = np.eye(3, dtype=np.complex64)[:, :2]
+
+        with mock.patch.object(reconstruction, "load_ref", return_value=integrated_ref):
+            actual = reconstruction._build_bart_calibration_kspace(
+                mprage_data_file="unused.dat",
+                Nx=4,
+                Ny=4,
+                Nz=4,
+                os_factor=2,
+                Nacs=2,
+                Wcc=compression,
+            )
+
+        expected_acs = _centered_fft(logical_image)[..., :2]
+        self.assertEqual(actual.shape, (4, 4, 4, 2))
+        np.testing.assert_allclose(
+            actual[:, 1:3, 1:3, :],
+            expected_acs,
+            rtol=2e-6,
+            atol=2e-6,
+        )
+        self.assertEqual(np.count_nonzero(actual[:, :1]), 0)
+        self.assertEqual(np.count_nonzero(actual[:, 3:]), 0)
+        self.assertEqual(np.count_nonzero(actual[:, :, :1]), 0)
+        self.assertEqual(np.count_nonzero(actual[:, :, 3:]), 0)
+
+    def test_cache_tags_reject_stride_derived_calibration(self) -> None:
+        """Corrected PCA and CSM caches should have distinct identities."""
+
+        self.assertEqual(
+            reconstruction._coil_compression_cache_tag("case"),
+            "roimgcrop_case",
+        )
+        self.assertEqual(
+            reconstruction._espirit_cache_tag("case", "3d"),
+            "roimgcrop_case",
+        )
+        self.assertEqual(
+            reconstruction._espirit_cache_tag("case", "slice2d"),
+            "slice2d_sagmask_roimgcrop_case",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

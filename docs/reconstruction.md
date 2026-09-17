@@ -252,7 +252,9 @@ The current implementation does not move the full reconstruction to GPU.
 
 `3d` remains the reference mode. It estimates one joint 3D calibration and can use either CPU or GPU.
 
-`slice2d` is an optional CPU-only acceleration path. The reconstruction first performs its existing readout-oversampling removal and coil compression, yielding logical k-space ordered as `(coil, RO, LIN, PAR)`. It then inverse-transforms logical RO and runs independent 2D ESPIRiT calibrations over the joint LIN-PAR plane. This preserves calibration coupling across both accelerated phase-encoding dimensions while removing coupling only along the fully sampled readout direction.
+`slice2d` is an optional CPU-only acceleration path. For both calibration modes, the integrated ACS is first transformed along the full oversampled readout, center-cropped in image space to the nominal FOV, and transformed back to logical readout k-space. Coil-compression estimation and ESPIRiT therefore use the same alias-free logical ACS ordered as `(coil, RO, LIN, PAR)`. `slice2d` then inverse-transforms logical RO and runs independent 2D ESPIRiT calibrations over the joint LIN-PAR plane. This preserves calibration coupling across both accelerated phase-encoding dimensions while removing coupling only along the fully sampled readout direction.
+
+Directly selecting every fourth readout k-space sample is not equivalent to removing fourfold readout oversampling: it aliases the extended readout FOV into the nominal FOV. The reconstruction does not use that legacy stride operation for coil calibration. The acquired Wave image k-space and PSF retain their oversampled readout because the Wave forward model requires it; only the ACS used for compression, ESPIRiT, and exported BART calibration input is converted to the logical readout grid.
 
 Because `slice2d` estimates logical-RO positions independently, it is not mathematically identical to joint 3D ESPIRiT. Validate representative datasets by comparing CSM support, magnitude and phase continuity along logical RO, low-SNR anterior anatomy, final reconstruction differences, runtime, and peak memory.
 
@@ -399,14 +401,15 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
 
 This reuses the coil-compression matrix and the CSM cache for the selected ESPIRiT calibration mode when both exist. It is useful when ESPIRiT completed successfully but reconstruction failed later: rerun with the same output directory, `--file-tag`, and `--espirit-calib-mode`, then add `--reuse-coil-calib`.
 
-For `--file-tag test01`, the full-resolution map names are:
+For `--file-tag test01`, the corrected cache names are:
 
 ```text
-3d:       csm_full_test01.npy
-slice2d:  csm_full_slice2d_test01.npy
+compression: coil_compression_energy_roimgcrop_test01.npy
+3d CSM:     csm_full_roimgcrop_test01.npy
+slice2d CSM: csm_full_slice2d_sagmask_roimgcrop_test01.npy
 ```
 
-The mode-specific names prevent a `slice2d` run from silently reusing a 3D CSM, or vice versa. The coil-compression matrix remains shared because calibration mode does not change coil compression. Use cached files only when the TWIX measurement, acquisition geometry, coil configuration, ACS data, compression settings, reconstruction dimensions, ESPIRiT mode, and intended crop setting match. A different `--espirit-crop` value is not applied to a reused map.
+The `roimgcrop` identity prevents corrected runs from silently reusing legacy stride-derived PCA or CSM caches. The mode-specific names also prevent a `slice2d` run from silently reusing a 3D CSM, or vice versa. The coil-compression matrix remains shared between ESPIRiT modes because calibration mode does not change coil compression. Use cached files only when the TWIX measurement, acquisition geometry, coil configuration, ACS data, compression settings, reconstruction dimensions, ESPIRiT mode, and intended crop setting match. A different `--espirit-crop` value is not applied to a reused map.
 
 The supported option name is `--reuse-coil-calib`.
 
@@ -444,7 +447,7 @@ Also export phase in radians with:
 --save-nifti-phase
 ```
 
-The helper reads orientation from the MPRAGE TWIX MeasYaps geometry, center-crops readout oversampling only for the NIfTI output, and writes `.nii.gz` plus JSON sidecars.
+The helper reads orientation from the MPRAGE TWIX MeasYaps geometry, center-crops the reconstructed image readout for the NIfTI output, and writes `.nii.gz` plus JSON sidecars. This final image export crop is separate from the IFFT-crop-FFT operation applied to integrated ACS k-space before coil calibration.
 
 Important defaults:
 

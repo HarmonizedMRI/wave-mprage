@@ -32,7 +32,11 @@ Assumed data conventions
 Functions
 ---------
 
-estimate_cc_matrix_coillast(kspace, ncc=12, acs=24, x_step=4, eps=1e-8)
+remove_readout_oversampling_kspace(kspace, oversampling_factor, axis=0)
+    Remove readout oversampling by transforming to image space, center-cropping
+    the nominal FOV, and transforming back to logical readout k-space.
+
+estimate_cc_matrix_coillast(kspace, ncc=12, acs=24, x_step=1, eps=1e-8)
     Estimate a coil-compression matrix W from a small central ACS calibration
     block using the coil covariance matrix. The input is coil-last k-space
     shaped (Nx, Ny, Nz, Ncoil). The returned W has shape (Ncoil, Ncc).
@@ -54,19 +58,25 @@ Typical workflow
 
        kspace_echo, mask_2d = load_merged_img_ref(...)
 
-2. Estimate coil compression from the merged full k-space:
+2. Remove readout oversampling before estimating coil compression:
+
+       kspace_logical = remove_readout_oversampling_kspace(
+           kspace_echo,
+           oversampling_factor=4,
+           axis=0,
+       )
 
        Wcc, svals, energy = estimate_cc_matrix_coillast(
-           kspace_echo,
+           kspace_logical,
            ncc=12,
            acs=24,
-           x_step=4,
+           x_step=1,
        )
 
 3. Build a low-resolution coil-first k-space for ESPIRiT:
 
        kspace_np = (
-           kspace_echo
+           kspace_logical
            .permute(3, 0, 1, 2)
            .contiguous()
            .numpy()
@@ -90,7 +100,7 @@ Typical workflow
 
 5. Compress full-resolution k-space, if needed:
 
-       kspace_cc = apply_cc_coillast_torch(kspace_echo, Wcc, x_chunk=8)
+       kspace_cc = apply_cc_coillast_torch(kspace_logical, Wcc, x_chunk=8)
 
 Notes
 -----
@@ -107,15 +117,124 @@ Notes
   coil-first array is approximately 12.9 GB. Avoid unnecessary full copies.
 """
 
-import numpy as np
-import torch
-import scipy.linalg as la
+import operator
 
-def estimate_cc_matrix_coillast(kspace, ncc=12, acs=24, x_step=4, eps=1e-8):
+import numpy as np
+import scipy.linalg as la
+import torch
+
+
+def remove_readout_oversampling_kspace(kspace, oversampling_factor, axis=0):
+    """Remove readout oversampling without introducing image-domain aliasing.
+
+    Args:
+        kspace: Complex NumPy array or PyTorch tensor containing centered
+            k-space. The selected axis must contain the oversampled readout.
+        oversampling_factor: Integer factor by which the readout length exceeds
+            the logical reconstruction matrix.
+        axis: Readout axis in ``kspace``.
+
+    Returns:
+        The same array type with the readout axis reduced by
+        ``oversampling_factor``. PyTorch device and complex dtype are retained;
+        NumPy output is complex64.
+
+    Raises:
+        TypeError: If the input is not a NumPy array or PyTorch tensor.
+        ValueError: If dimensions, factor, axis, dtype, or values are invalid.
+
+    Notes:
+        Direct k-space striding aliases the oversampled image FOV. This helper
+        instead applies a centered orthonormal IFFT, crops the central nominal
+        image FOV, and applies a centered orthonormal FFT.
+    """
+    try:
+        factor = operator.index(oversampling_factor)
+    except TypeError as exc:
+        raise ValueError("Readout oversampling factor must be an integer.") from exc
+    if isinstance(oversampling_factor, (bool, np.bool_)) or factor < 1:
+        raise ValueError("Readout oversampling factor must be a positive integer.")
+
+    if not isinstance(kspace, (np.ndarray, torch.Tensor)):
+        raise TypeError("Readout oversampling removal requires NumPy or PyTorch data.")
+    if kspace.ndim < 1:
+        raise ValueError("Readout oversampling removal requires a non-scalar array.")
+    try:
+        resolved_axis = operator.index(axis)
+    except TypeError as exc:
+        raise ValueError("Readout axis must be an integer.") from exc
+    if isinstance(axis, (bool, np.bool_)):
+        raise ValueError("Readout axis must be an integer.")
+    if not -kspace.ndim <= resolved_axis < kspace.ndim:
+        raise ValueError(f"Readout axis {axis} is invalid for shape {tuple(kspace.shape)}.")
+    resolved_axis %= kspace.ndim
+    readout_oversampled = int(kspace.shape[resolved_axis])
+    if readout_oversampled % factor:
+        raise ValueError(
+            f"Readout length {readout_oversampled} is not divisible by factor {factor}."
+        )
+    readout_logical = readout_oversampled // factor
+    start = readout_oversampled // 2 - readout_logical // 2
+    stop = start + readout_logical
+    selection = [slice(None)] * kspace.ndim
+    selection[resolved_axis] = slice(start, stop)
+
+    if isinstance(kspace, torch.Tensor):
+        if not torch.is_complex(kspace):
+            raise ValueError("Readout k-space must be complex-valued.")
+        if not torch.isfinite(kspace).all():
+            raise ValueError("Readout k-space contains non-finite values.")
+        image_oversampled = torch.fft.fftshift(
+            torch.fft.ifft(
+                torch.fft.ifftshift(kspace, dim=(resolved_axis,)),
+                dim=resolved_axis,
+                norm="ortho",
+            ),
+            dim=(resolved_axis,),
+        )
+        image_logical = image_oversampled[tuple(selection)]
+        logical_kspace = torch.fft.fftshift(
+            torch.fft.fft(
+                torch.fft.ifftshift(image_logical, dim=(resolved_axis,)),
+                dim=resolved_axis,
+                norm="ortho",
+            ),
+            dim=(resolved_axis,),
+        )
+        return logical_kspace.contiguous()
+
+    values = np.asarray(kspace)
+    if not np.iscomplexobj(values):
+        raise ValueError("Readout k-space must be complex-valued.")
+    if not np.isfinite(values).all():
+        raise ValueError("Readout k-space contains non-finite values.")
+    image_oversampled = np.fft.fftshift(
+        np.fft.ifft(
+            np.fft.ifftshift(values, axes=(resolved_axis,)),
+            axis=resolved_axis,
+            norm="ortho",
+        ),
+        axes=(resolved_axis,),
+    )
+    image_logical = image_oversampled[tuple(selection)]
+    logical_kspace = np.fft.fftshift(
+        np.fft.fft(
+            np.fft.ifftshift(image_logical, axes=(resolved_axis,)),
+            axis=resolved_axis,
+            norm="ortho",
+        ),
+        axes=(resolved_axis,),
+    )
+    return np.ascontiguousarray(logical_kspace, dtype=np.complex64)
+
+def estimate_cc_matrix_coillast(kspace, ncc=12, acs=24, x_step=1, eps=1e-8):
     """
     Estimate SVD coil compression matrix from central ACS.
 
     kspace: torch or numpy, shape (Nx, Ny, Nz, ncoil)
+    ``x_step`` may reduce computation after k-space is already on the logical
+    readout grid. It must not be used to remove readout oversampling.
+
     returns W: numpy complex64, shape (ncoil, ncc)
     """
     Nx, Ny, Nz, ncoil = kspace.shape

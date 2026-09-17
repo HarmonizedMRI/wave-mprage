@@ -62,6 +62,31 @@ class BartIoTests(unittest.TestCase):
 
             self.assertEqual(manifest["psf_calibration"]["kx_range"], [12, 96])
 
+    def test_records_optional_coil_calibration_provenance(self) -> None:
+        """The BART manifest should identify readout de-oversampling."""
+
+        with tempfile.TemporaryDirectory() as folder:
+            manifest_path = export_wave_inputs(
+                folder,
+                wave_kspace=np.ones((8, 3, 2, 1, 2), np.complex64),
+                calibrated_psf=np.ones((1, 8, 3, 2), np.complex64),
+                coil_sens=np.ones((2, 4, 3, 2), np.complex64),
+                kspace_calib=np.ones((4, 3, 2, 2), np.complex64),
+                coil_calibration={
+                    "method": "centered-image-domain-crop",
+                    "version": 1,
+                    "oversampling_factor": 2,
+                    "input_readout": 8,
+                    "output_readout": 4,
+                },
+            )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(
+                manifest["coil_calibration"]["method"],
+                "centered-image-domain-crop",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

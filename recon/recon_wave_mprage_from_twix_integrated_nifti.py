@@ -79,6 +79,12 @@ plt.rcParams.update({
     'figure.titlesize': 18,
 })
 
+READOUT_OVERSAMPLING_REMOVAL = {
+    "method": "centered-image-domain-crop",
+    "version": 1,
+    "fft_normalization": "ortho",
+}
+
 
 def main():
     cfg = _collect_runtime_config()
@@ -263,6 +269,12 @@ def main():
                 coil_sens=csm_full_cc_np,
                 kspace_calib=kspace_calib,
                 psf_calibration=psf_processing_diagnostics,
+                coil_calibration={
+                    **READOUT_OVERSAMPLING_REMOVAL,
+                    "oversampling_factor": int(os_factor),
+                    "input_readout": int(Nx * os_factor),
+                    "output_readout": int(Nx),
+                },
             )
             print(f"Saved BART Wave-CAIPI inputs: {manifest_path}")
 
@@ -632,6 +644,12 @@ def _build_mprage_nifti_metadata(
         "WaveReconstructionTag": tag_wave,
         "FileTag": file_tag,
         "ReadoutOversamplingFactor": int(os_factor),
+        "CoilCalibrationReadoutOversamplingRemoval": {
+            **READOUT_OVERSAMPLING_REMOVAL,
+            "oversampling_factor": int(os_factor),
+            "input_readout": int(geom["Nro"] * os_factor),
+            "output_readout": int(geom["Nro"]),
+        },
         "Acceleration": {"Ry": int(Ry), "Rz": int(Rz)},
         "IntegratedCalibration": True,
         "Ncalib": int(ncalib),
@@ -851,7 +869,8 @@ def load_or_generate_coil_sens(
 ):
     """Load cached Wcc/CSM or generate them from the integrated ACS refscan set."""
     csm_tag = _espirit_cache_tag(file_tag, espirit_calib_mode)
-    wcc_file = _npy_output_path(out_folder + 'coil_compression_energy_' + file_tag)
+    compression_tag = _coil_compression_cache_tag(file_tag)
+    wcc_file = _npy_output_path(out_folder + 'coil_compression_energy_' + compression_tag)
     csm_file = _npy_output_path(out_folder + 'csm_full_' + csm_tag)
 
     if reuse_coil_calib and os.path.isfile(wcc_file) and os.path.isfile(csm_file):
@@ -936,16 +955,23 @@ def generate_coil_sens(
     _check_integrated_refscan_shape(data_ref, Nacs=Nacs, Ncalib=None)
     kspace_nowave_acs = data_ref[:, :Nacs, :Nacs, -1, :]
     Nx_os, Ny_acs, Nz_acs, Ncoil = kspace_nowave_acs.shape
-    Nx = Nx_os // os_factor
+    kspace_nowave_logical = remove_readout_oversampling_kspace(
+        kspace_nowave_acs, os_factor, axis=0
+    )
+    Nx = int(kspace_nowave_logical.shape[0])
 
-    print(f"Integrated ACS shape: {tuple(kspace_nowave_acs.shape)}")
+    print(
+        "Integrated ACS readout de-oversampling: "
+        f"{tuple(kspace_nowave_acs.shape)} -> {tuple(kspace_nowave_logical.shape)} "
+        "using centered image-domain crop"
+    )
 
-    # calculate coil compression energy
+    # Estimate compression on the same nominal-FOV ACS used by ESPIRiT.
     Wcc, cc_svals, cc_energy = estimate_cc_matrix_coillast(
-        kspace_nowave_acs,
+        kspace_nowave_logical,
         ncc=12,
         acs=min(Ny_acs, Nz_acs),
-        x_step=os_factor,
+        x_step=1,
     )
     print("Wcc:", Wcc.shape)
     print("Energy retained by 12 coils:", cc_energy[11])
@@ -953,8 +979,8 @@ def generate_coil_sens(
     # For ESPIRiT, only make low-res CPU array first.
     # Convert to coil-first: (32, x, y, z)
     kspace_nowave_np = (
-        kspace_nowave_acs
-        .permute(3, 0, 1, 2)[:, ::os_factor]
+        kspace_nowave_logical
+        .permute(3, 0, 1, 2)
         .contiguous()
         .numpy()
         .astype(np.complex64, copy=False)
@@ -1037,9 +1063,9 @@ def generate_coil_sens(
         where=rss > 1e-8,
     )
 
-    # Save the Wcc once, but keep sensitivity-map products mode-specific so
-    # --reuse-coil-calib cannot silently mix 3d and slice2d estimates.
-    _save_npy(out_folder + 'coil_compression_energy_' + file_tag, Wcc, 'coil compression matrix')
+    # Version cache names so pre-fix stride-derived calibrations cannot be reused.
+    compression_tag = _coil_compression_cache_tag(file_tag)
+    _save_npy(out_folder + 'coil_compression_energy_' + compression_tag, Wcc, 'coil compression matrix')
     _save_npy(out_folder + 'csm_acs_' + csm_tag, csm_low_cc_np, 'low-resolution ESPIRiT CSM')
     _save_npy(out_folder + 'csm_full_' + csm_tag, csm_full_cc_np, 'full-resolution ESPIRiT CSM')
     plot_csm_magnitude_grid(csm_full_cc_np, z=csm_full_cc_np.shape[-1] // 2)
@@ -1071,8 +1097,10 @@ def _build_bart_calibration_kspace(
     data_ref = load_ref(mprage_data_file)
     _check_integrated_refscan_shape(data_ref, Nacs=Nacs, Ncalib=None)
     kspace_acs = data_ref[:, :Nacs, :Nacs, -1, :]
-    kspace_acs_cc = apply_cc_coillast_torch(kspace_acs, Wcc, x_chunk=8)
-    kspace_acs_cc = kspace_acs_cc[::os_factor]
+    kspace_acs_logical = remove_readout_oversampling_kspace(
+        kspace_acs, os_factor, axis=0
+    )
+    kspace_acs_cc = apply_cc_coillast_torch(kspace_acs_logical, Wcc, x_chunk=8)
     ncc = int(Wcc.shape[1])
     expected = (Nx, Nacs, Nacs, ncc)
     if tuple(kspace_acs_cc.shape) != expected:
@@ -2091,17 +2119,31 @@ def _npy_output_path(path_without_ext):
 
 
 def _espirit_cache_tag(file_tag, mode):
-    """Return a mode-specific CSM tag for the SAG MPRAGE implementation."""
+    """Return a mode- and RO-processing-specific CSM cache tag."""
     mode = str(mode).strip().lower()
     file_tag = str(file_tag)
     if mode == "3d":
-        return file_tag
+        prefix = "roimgcrop"
+        return prefix if file_tag == "" else prefix + "_" + file_tag
     if mode == "slice2d":
-        # The SAG whole-plane RO guard changes the estimator output, so use a
-        # distinct cache tag rather than reusing pre-guard slice2d CSMs.
-        prefix = "slice2d_sagmask"
+        # Both the SAG support guard and RO image crop affect the CSM identity.
+        prefix = "slice2d_sagmask_roimgcrop"
         return prefix if file_tag == "" else prefix + "_" + file_tag
     raise ValueError("ESPIRiT calibration mode must be '3d' or 'slice2d'.")
+
+
+def _coil_compression_cache_tag(file_tag):
+    """Return a cache tag that rejects legacy stride-derived PCA bases.
+
+    Args:
+        file_tag: User-provided output suffix.
+
+    Returns:
+        Cache tag containing the nominal-FOV image-crop processing identity.
+    """
+    file_tag = str(file_tag)
+    prefix = "roimgcrop"
+    return prefix if file_tag == "" else prefix + "_" + file_tag
 
 
 def _save_npy(path_without_ext, array, label):
