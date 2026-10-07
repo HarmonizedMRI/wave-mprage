@@ -107,7 +107,7 @@ fprintf(['Requested resolution [x y z] = [%.4g %.4g %.4g] mm. ', ...
 % MPRAGE imaging and the appended FLASH calibration.
 swave_max = 200;                  % T/m/s, capped by physical_slew_max
 if ~exist('Ncycles', 'var') || isempty(Ncycles)
-    Ncycles = 20;
+    Ncycles = 10;
 end
 switch Ncycles
     case 10
@@ -236,7 +236,7 @@ elseif strcmp(sys_type,'CimaX')
 elseif strcmp(sys_type,'TerraX')
     physical_slew_max = 250;
     physical_grad_max = 135;
-    B0=2.89;
+    B0=6.98;
 else
     error('Undefined')
 end
