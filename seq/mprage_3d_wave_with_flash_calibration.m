@@ -83,7 +83,7 @@ rfLen         = 100e-6;
 
 % The integrated sequence supports the sagittal geometry only.
 slOrientation = 'SAG';
-fov = [200 240 250]*1e-3;        % matched test [x y z], m
+fov = [192 256 250]*1e-3;        % [PAR/x LIN/y RO/z], m
 res = [1.0 1.0 1.0];             % requested [x y z], mm
 N = 2 * round((fov(:).' * 1e3 ./ res) / 2);
 actualRes = fov(:).' ./ N * 1e3;
@@ -178,7 +178,7 @@ TI    = 1.1;
 TRout = 2.5;
 R1 = 1;                           % acceleration along ax.d2 / PAR
 R2 = 3;                           % acceleration along ax.d3 / LIN
-ETLtarget = 250;
+ETLtarget = 256;
 
 etlSeg = struct;
 etlSeg.sMin      = 16;
