@@ -1,15 +1,15 @@
-% mprage_3d_wave_with_flash_calibration.m
+% Sagittal Wave-MPRAGE with parity-aware high-slew wave cases and appended FLASH calibration.
 % Author: Yiyun Dong
 % Affiliation: Athinoula A. Martinos Center for Biomedical Imaging
-% Date: 2026-07-15
+% Date: 2026-09-21
 %
 % Integrated Wave-MPRAGE + FLASH wave-calibration sequence.
 %
 % TWIX routing:
 %   image:
-%       MPRAGE imaging data only, with REF=false, IMA=false, SET=0.
+%       MPRAGE imaging data only, with REF=false, IMA=false, SET=0, AVG=0.
 %   refscan:
-%       FLASH calibration data only, with REF=true and IMA=false:
+%       FLASH calibration data only, with REF=true, IMA=false, and AVG=0:
 %         SET 0: no-wave, ky-wide / kz-narrow
 %         SET 1: sin-wave, ky-wide / kz-narrow
 %         SET 2: no-wave, kz-wide / ky-narrow
@@ -23,8 +23,9 @@
 % Acquisition order is MPRAGE first, followed by FLASH calibration. The
 % calibration includes its own dummy RF-spoiled GRE train.
 %
-% Wave-gradient and scheduling helpers are stored in ./utils/. The existing
-% forbiddenFreqCheck.m is expected in ./utils/ or elsewhere on the MATLAB path.
+% Scheduling and high-slew wave/ramp helpers live in ./utils/.
+% forbiddenFreqCheck.m is expected in the published utils folder or elsewhere
+% on the MATLAB path.
 
 % Do not call clear/clear all here: users may predefine path variables in the
 % MATLAB workspace before running this script.
@@ -33,9 +34,7 @@ format long
 
 %% Path
 script_dir = fileparts(mfilename('fullpath'));
-if isempty(script_dir)
-    script_dir = pwd;
-end
+repo_root = fileparts(script_dir);
 
 % Add extracted helper functions before the first helper call below.
 utils_path = fullfile(script_dir, 'utils');
@@ -45,14 +44,12 @@ else
     error('Required local utils folder not found: %s', utils_path);
 end
 
-% Path settings are stored locally beside this script in
-% mprage_flash_path_settings.json. When that file already exists, the user
-% can reuse all saved paths or choose specific entries to update.
-pathSettings = configurePathSettings(script_dir);
-pulseq_path = pathSettings.pulseq_path;
-safe_pns_prediction_path = pathSettings.safe_pns_prediction_path;
-out_path = ensureTrailingFilesep(pathSettings.out_path);
-system_asc_file = pathSettings.system_asc_file;
+% Evaluation artifacts stay outside the MATLAB source tree.
+pulseq_path = '/Users/yiyund/Code_mgh/pulseq';
+safe_pns_prediction_path = '/Users/yiyund/Code_mgh/safe_pns_prediction';
+out_path = fullfile(repo_root, 'evaluation', 'output', 'v1.5.1', ...
+    'high_slew_wave_mprage');
+system_asc_file = '/Users/yiyund/Code_mgh/pulseq/matlab/idea/asc/MP_GPA_K2309_2250V_793A_GC99.asc';
 
 pulseq_matlab_path = fullfile(pulseq_path, 'matlab');
 if exist(fullfile(pulseq_matlab_path, '+mr'), 'dir')
@@ -73,10 +70,12 @@ end
 % Write options:
 %   false -> current Pulseq format only
 %   true  -> write both legacy v1.4.1 and current format
-write_v141_format = true;
+% Keep this false: the arbitrary wave-gradient boundary values do not survive
+% the v1.4.1 write/read round trip, and the reloaded file fails checkTiming.
+write_v141_format = false;
 
 alpha    = 7;
-ro_dur   = 5120e-6;
+ro_dur   = 5000e-6;
 ro_os    = 4;
 ro_spoil = 3;
 rfSpoilingInc = 50;
@@ -84,7 +83,7 @@ rfLen         = 100e-6;
 
 % The integrated sequence supports the sagittal geometry only.
 slOrientation = 'SAG';
-fov = [220 256 256]*1e-3;        % [x y z], m
+fov = [200 240 250]*1e-3;        % matched test [x y z], m
 res = [1.0 1.0 1.0];             % requested [x y z], mm
 N = 2 * round((fov(:).' * 1e3 ./ res) / 2);
 actualRes = fov(:).' ./ N * 1e3;
@@ -104,10 +103,33 @@ fprintf(['Requested resolution [x y z] = [%.4g %.4g %.4g] mm. ', ...
     res(1), res(2), res(3), N(1), N(2), N(3), ...
     actualRes(1), actualRes(2), actualRes(3));
 
-% Shared wave parameters.
-gwave_max = 8;                    % mT/m
-swave_max = 200;                  % T/m/s
-Ncycles   = 10;
+% Shared hard-coded high-slew wave cases. The selected case applies to both
+% MPRAGE imaging and the appended FLASH calibration.
+swave_max = 200;                  % T/m/s, capped by physical_slew_max
+if ~exist('Ncycles', 'var') || isempty(Ncycles)
+    Ncycles = 20;
+end
+switch Ncycles
+    case 10
+        gwave_max = 12.732;       % mT/m
+        gwave_name = '12p732';
+    case 20
+        gwave_max = 6.3662;       % mT/m
+        gwave_name = '6p3662';
+    case 25
+        gwave_max = 5.093;        % mT/m
+        gwave_name = '5p093';
+    otherwise
+        error(['Supported wave cases are Ncycles=10/Gmax=12.732, ', ...
+            'Ncycles=20/Gmax=6.3662, and Ncycles=25/Gmax=5.093 mT/m.']);
+end
+
+% false makes every sine-wave ADC center cross its no-wave k-space line.
+% true adds the parity-aware pre/post moment that centers the corkscrew.
+if ~exist('centerWaveAroundNowave', 'var') || ...
+        isempty(centerWaveAroundNowave)
+    centerWaveAroundNowave = false;
+end
 
 %% FLASH calibration-only parameters
 Ndummy = 300;
@@ -123,7 +145,7 @@ calibRfDuration    = 1.0e-3;     % [s]
 calibRfTBW         = 20;
 calibRfApodization = 0.42;
 calibSlabAxis      = ax.d2;      % Gx for SAG
-calibSlabThickness = fov(ax.n2); % FOVx = 192 mm by default
+calibSlabThickness = fov(ax.n2); % matched FOVx = 200 mm
 
 assert(Ncalib1 == round(Ncalib1) && Ncalib1 > 0, ...
     'Ncalib1 must be a positive integer.');
@@ -154,7 +176,7 @@ TI    = 1.1;
 TRout = 2.5;
 R1 = 1;                           % acceleration along ax.d2 / PAR
 R2 = 3;                           % acceleration along ax.d3 / LIN
-ETLtarget = 220;
+ETLtarget = 250;
 
 etlSeg = struct;
 etlSeg.sMin      = 16;
@@ -165,8 +187,8 @@ etlSeg.savedMin  = 16;
 
 % These flags affect MPRAGE only. Calibration always acquires its required
 % no-wave, sine-wave, and cosine-wave parts from the shared event library.
-isUseWave_cos = false;
-isUseWave_sin = false;
+isUseWave_cos = true;
+isUseWave_sin = true;
 
 assert(R1 >= 1 && R1 == round(R1), 'R1 must be a positive integer.');
 assert(R2 >= 1 && R2 == round(R2), 'R2 must be a positive integer.');
@@ -179,8 +201,7 @@ assert(ETLtarget >= 1 && ETLtarget == round(ETLtarget), ...
     % 'rfRingdownTime', 20e-6, 'rfDeadtime', 100e-6, 'adcDeadTime', 10e-6);
 
 % For Siemens scanner
-sys_type_options          = {'prisma', 'skyra', 'Connectome2', 'C2_simulate_prisma', 'trio', 'prisma_XA30A', 'premier', 'CimaX', 'TerraX'};
-sys_type                  = selectStringOption('sys_type', 'Select scanner/system name', sys_type_options, 'prisma');
+sys_type                  = 'skyra';
 slew_safety_magrin        = 0.7;
 grad_safety_magrin        = 0.9;
 lowPNS_slew_safety_margin = 0.35;
@@ -228,7 +249,7 @@ if isGEscanner
     % RF/gradient delay (sec).
     % Conservative choice that should work across all GE scanners.
     psd_rf_wait = 200e-6;  % section 5.4 in PulseqOnGE_v1.0.pdf
-    
+
     rfDeadTime =  100e-6;
     rfRingdownTime = 60e-6 + psd_rf_wait;
     adcDeadTime = 20e-6;
@@ -266,6 +287,21 @@ sys_lowPNS = mr.opts('MaxGrad',physical_grad_max*lowPNS_grad_safety_margin,'Grad
     'gradRasterTime', gradRasterTime,...
     'blockDurationRaster', blockDurationRaster,...
     'B0',B0);
+% The sequence object uses the physical Skyra slew envelope. Only active
+% sine/cosine samples are designed against this limit; wave ramps and all
+% non-wave preparation/rewinding events remain assigned to sys_lowPNS.
+sys_sequence = mr.opts( ...
+    'MaxGrad', physical_grad_max*grad_safety_magrin, 'GradUnit', 'mT/m', ...
+    'MaxSlew', physical_slew_max, 'SlewUnit', 'T/m/s', ...
+    'rfDeadTime', rfDeadTime, ...
+    'rfRingdownTime', rfRingdownTime, ...
+    'adcDeadTime', adcDeadTime, ...
+    'adcRasterTime', adcRasterTime, ...
+    'rfRasterTime', rfRasterTime, ...
+    'gradRasterTime', gradRasterTime, ...
+    'blockDurationRaster', blockDurationRaster, ...
+    'B0', B0);
+sys_wave = sys_sequence;
 sys_diff = mr.opts('MaxGrad',physical_grad_max*diff_grad_safety_margin,'GradUnit','mT/m',...
     'MaxSlew',physical_slew_max*diff_slew_safety_margin,'SlewUnit','T/m/s',...
     'rfDeadtime', rfDeadTime, ...
@@ -278,8 +314,17 @@ sys_diff = mr.opts('MaxGrad',physical_grad_max*diff_grad_safety_margin,'GradUnit
     'B0',B0);
 lims = sys;
 
+requestedWaveSlew = 2*pi*Ncycles/ro_dur*gwave_max*1e-3;
+assert(requestedWaveSlew <= min(physical_slew_max, swave_max)+1e-12, ...
+    ['Selected cycle/amplitude case would be slew limited: requested ', ...
+    '%.6f T/m/s, available %.6f T/m/s.'], ...
+    requestedWaveSlew, min(physical_slew_max, swave_max));
+fprintf(['High-slew Wave-MPRAGE case: cycles=%d, Gmax=%.6f mT/m, ', ...
+    'continuous peak slew=%.6f T/m/s, sine centered=%d.\n'], ...
+    Ncycles, gwave_max, requestedWaveSlew, centerWaveAroundNowave);
+
 % Create the single integrated sequence object.
-seq = mr.Sequence(sys);
+seq = mr.Sequence(sys_sequence);
 
 %% Shared RF/readout/wave event library
 rf = mr.makeBlockPulse(alpha*pi/180, sys, ...
@@ -328,6 +373,31 @@ rf.delay = mr.calcDuration(groSp, gpe1, gpe2);
 gPre_dur = max([mr.calcDuration(groPre), ...
     mr.calcDuration(gpe1), mr.calcDuration(gpe2)]);
 gPre_dur = ceil(gPre_dur/sys.gradRasterTime)*sys.gradRasterTime;
+
+% Calibration PE areas follow the accepted negative-to-positive physical
+% convention. Imaging retains the current matched Wave-MPRAGE convention;
+% both tables use the same high-slew wave helper implementation below.
+calibParAreas = ((0:N(ax.n2)-1)-N(ax.n2)/2)*deltak(ax.n2);
+calibLinAreas = ((0:N(ax.n3)-1)-N(ax.n3)/2)*deltak(ax.n3);
+assert(all(diff(calibParAreas) > 0) && all(diff(calibLinAreas) > 0), ...
+    'Calibration PE targets must increase from negative to positive.');
+
+% Find one low-PNS cosine PE/ramp-up duration that is feasible for every
+% physical PAR target. A common duration preserves one ADC delay and TE.
+G0CosPulseq = gwave_max*1e-3*sys.gamma;
+cosCenterPolarity = (-1)^Ncycles;
+cosSampleCorrection = cosCenterPolarity*G0CosPulseq*adc.dwell/2;
+cosRampTargets = [calibParAreas-cosSampleCorrection, ...
+    -calibParAreas-cosSampleCorrection];
+minCosRampDuration = gPre_dur+gro.riseTime;
+cosRampDuration = findCommonHighSlewCosinePreRampDuration( ...
+    cosRampTargets, G0CosPulseq, minCosRampDuration, sys_lowPNS);
+gPre_dur = max(gPre_dur, cosRampDuration-gro.riseTime);
+gPre_dur = ceil(gPre_dur/sys.gradRasterTime)*sys.gradRasterTime;
+fprintf(['Low-PNS common prephaser duration=%.6f ms; ', ...
+    'cosine PE/ramp-up duration=%.6f ms.\n'], ...
+    gPre_dur*1e3, (gPre_dur+gro.riseTime)*1e3);
+
 groPre  = mr.makeTrapezoid(ax.d1, 'Area', groPre.area, ...
     'Duration', gPre_dur, 'system', sys_lowPNS);
 gpe1Pre = mr.makeTrapezoid(ax.d2, 'Area', gpe1.area, ...
@@ -335,9 +405,24 @@ gpe1Pre = mr.makeTrapezoid(ax.d2, 'Area', gpe1.area, ...
 gpe2Pre = mr.makeTrapezoid(ax.d3, 'Area', gpe2.area, ...
     'Duration', gPre_dur, 'system', sys_lowPNS);
 
+calibParMaxAbsArea = max(abs(calibParAreas));
+calibLinMaxAbsArea = max(abs(calibLinAreas));
+gpe1CalMax = mr.makeTrapezoid(ax.d2, ...
+    'Area', calibParMaxAbsArea, 'system', sys_lowPNS);
+gpe2CalMax = mr.makeTrapezoid(ax.d3, ...
+    'Area', calibLinMaxAbsArea, 'system', sys_lowPNS);
+gpe1CalPreMax = mr.makeTrapezoid(ax.d2, ...
+    'Area', calibParMaxAbsArea, 'Duration', gPre_dur, ...
+    'system', sys_lowPNS);
+gpe2CalPreMax = mr.makeTrapezoid(ax.d3, ...
+    'Area', calibLinMaxAbsArea, 'Duration', gPre_dur, ...
+    'system', sys_lowPNS);
+
 gro1.delay = mr.calcDuration(groPre);
 adc.delay = gro1.delay + gro.riseTime;
 gro1 = mr.addGradients({gro1, groPre}, 'system', sys);
+
+cosRampUpDuration = adc.delay;
 
 pe1Steps = ((0:N(ax.n2)-1)-N(ax.n2)/2)/N(ax.n2)*2;
 pe2Steps = ((0:N(ax.n3)-1)-N(ax.n3)/2)/N(ax.n3)*2;
@@ -348,60 +433,130 @@ MODE_SIN    = 2;
 MODE_COS    = 3;
 modeNames = {'nowave', 'sin', 'cos'};
 
-% PE1/PAR: cosine wave for sagittal geometry.
+% Imaging tables retain the current matched Wave-MPRAGE PE direction.
 gpe1Pre_nowave  = cell(1, N(ax.n2));
 gpe1Post_nowave = cell(1, N(ax.n2));
 gpe1Pre_cos     = cell(1, N(ax.n2));
 gpe1Post_cos    = cell(1, N(ax.n2));
-
-% PE2/LIN: sine wave for sagittal geometry.
 gpe2Pre_nowave  = cell(1, N(ax.n3));
 gpe2Post_nowave = cell(1, N(ax.n3));
 gpe2Pre_sin     = cell(1, N(ax.n3));
 gpe2Post_sin    = cell(1, N(ax.n3));
 
-allPostDur = [];
+% Calibration tables use increasing physical k-space with increasing local
+% LIN/PAR indices, matching the standalone high-slew calibration files.
+gpe1CalPre_nowave  = cell(1, N(ax.n2));
+gpe1CalPost_nowave = cell(1, N(ax.n2));
+gpe1CalPre_cos     = cell(1, N(ax.n2));
+gpe1CalPost_cos    = cell(1, N(ax.n2));
+gpe2CalPre_nowave  = cell(1, N(ax.n3));
+gpe2CalPost_nowave = cell(1, N(ax.n3));
+gpe2CalPre_sin     = cell(1, N(ax.n3));
+gpe2CalPost_sin    = cell(1, N(ax.n3));
+
+imagePostDur = [];
+calibrationPostDur = [];
 for i = 1:N(ax.n2)
     gpe1Pre_i = mr.scaleGrad(gpe1Pre, pe1Steps(i));
-    gpe1Pre_nowave{i}  = gpe1Pre_i;
+    gpe1Pre_nowave{i} = gpe1Pre_i;
     gpe1Post_nowave{i} = mr.scaleGrad(gpe1, -pe1Steps(i));
-    gpe1Pre_nowave{i}.id  = seq.registerGradEvent(gpe1Pre_nowave{i});
-    gpe1Post_nowave{i}.id = seq.registerGradEvent(gpe1Post_nowave{i});
+    [gpe1Pre_cos{i}, gpe1Post_cos{i}] = ...
+        defineHighSlewCosineWaveGradient( ...
+        Tread, sys, sys_sequence, sys_wave, sys_lowPNS, ...
+        Ncycles, gwave_max, swave_max, gpe1Pre_i, gro, adc, ...
+        physical_slew_max, i == 1, i == 1);
 
-    debugFlag = (i == 1);
-    [gpe1Pre_cos{i}, gpe1Post_cos{i}] = defineCosineWaveGradient( ...
-        Tread, sys, sys_lowPNS, Ncycles, gwave_max, swave_max, ...
-        gpe1Pre_i, gro, adc, physical_slew_max, debugFlag, debugFlag);
-    gpe1Pre_cos{i}.id  = seq.registerGradEvent(gpe1Pre_cos{i});
-    gpe1Post_cos{i}.id = seq.registerGradEvent(gpe1Post_cos{i});
+    calScale = calibParAreas(i)/calibParMaxAbsArea;
+    gpe1CalPre_i = mr.scaleGrad(gpe1CalPreMax, calScale);
+    gpe1CalPre_nowave{i} = gpe1CalPre_i;
+    gpe1CalPost_nowave{i} = mr.scaleGrad(gpe1CalMax, -calScale);
+    [gpe1CalPre_cos{i}, gpe1CalPost_cos{i}] = ...
+        defineHighSlewCosineWaveGradient( ...
+        Tread, sys, sys_sequence, sys_wave, sys_lowPNS, ...
+        Ncycles, gwave_max, swave_max, gpe1CalPre_i, gro, adc, ...
+        physical_slew_max, false, false);
 
-    allPostDur = [allPostDur, ... %#ok<AGROW>
+    eventsToRegister = {gpe1Pre_nowave{i}, gpe1Post_nowave{i}, ...
+        gpe1Pre_cos{i}, gpe1Post_cos{i}, gpe1CalPre_nowave{i}, ...
+        gpe1CalPost_nowave{i}, gpe1CalPre_cos{i}, gpe1CalPost_cos{i}};
+    for eventIndex = 1:numel(eventsToRegister)
+        eventsToRegister{eventIndex}.id = ...
+            seq.registerGradEvent(eventsToRegister{eventIndex});
+    end
+    gpe1Pre_nowave{i} = eventsToRegister{1};
+    gpe1Post_nowave{i} = eventsToRegister{2};
+    gpe1Pre_cos{i} = eventsToRegister{3};
+    gpe1Post_cos{i} = eventsToRegister{4};
+    gpe1CalPre_nowave{i} = eventsToRegister{5};
+    gpe1CalPost_nowave{i} = eventsToRegister{6};
+    gpe1CalPre_cos{i} = eventsToRegister{7};
+    gpe1CalPost_cos{i} = eventsToRegister{8};
+
+    imagePostDur = [imagePostDur, ... %#ok<AGROW>
         mr.calcDuration(gpe1Post_nowave{i}), ...
         mr.calcDuration(gpe1Post_cos{i})];
+    calibrationPostDur = [calibrationPostDur, ... %#ok<AGROW>
+        mr.calcDuration(gpe1CalPost_nowave{i}), ...
+        mr.calcDuration(gpe1CalPost_cos{i})];
 end
 
+centerParIndex = floor(N(ax.n2)/2)+1;
+cosRampDownDuration = mr.calcDuration(gpe1CalPost_cos{centerParIndex});
+assert(abs(calibParAreas(centerParIndex)) < 1e-12, ...
+    'Cosine ramp reference must be the physical center PAR line.');
+
+sinOffsetInfoByLin = cell(1, N(ax.n3));
 for j = 1:N(ax.n3)
     gpe2Pre_j = mr.scaleGrad(gpe2Pre, pe2Steps(j));
-    gpe2Pre_nowave{j}  = gpe2Pre_j;
+    gpe2Pre_nowave{j} = gpe2Pre_j;
     gpe2Post_nowave{j} = mr.scaleGrad(gpe2, -pe2Steps(j));
-    gpe2Pre_nowave{j}.id  = seq.registerGradEvent(gpe2Pre_nowave{j});
-    gpe2Post_nowave{j}.id = seq.registerGradEvent(gpe2Post_nowave{j});
+    [gpe2Pre_sin{j}, gpe2Post_sin{j}] = ...
+        defineHighSlewSineWaveGradient( ...
+        Tread, sys, sys_sequence, sys_wave, sys_lowPNS, ...
+        Ncycles, gwave_max, swave_max, gpe2Pre_j, gro, adc, ...
+        physical_slew_max, centerWaveAroundNowave, ...
+        cosRampUpDuration, cosRampDownDuration, j == 1, j == 1);
 
-    debugFlag = (j == 1);
-    [gpe2Pre_sin{j}, gpe2Post_sin{j}] = defineSineWaveGradient( ...
-        Tread, sys, sys_lowPNS, Ncycles, gwave_max, swave_max, ...
-        gpe2Pre_j, gro, adc, physical_slew_max, debugFlag, debugFlag);
-    gpe2Pre_sin{j}.id  = seq.registerGradEvent(gpe2Pre_sin{j});
-    gpe2Post_sin{j}.id = seq.registerGradEvent(gpe2Post_sin{j});
+    calScale = calibLinAreas(j)/calibLinMaxAbsArea;
+    gpe2CalPre_j = mr.scaleGrad(gpe2CalPreMax, calScale);
+    gpe2CalPre_nowave{j} = gpe2CalPre_j;
+    gpe2CalPost_nowave{j} = mr.scaleGrad(gpe2CalMax, -calScale);
+    [gpe2CalPre_sin{j}, gpe2CalPost_sin{j}, ...
+            sinOffsetInfoByLin{j}] = defineHighSlewSineWaveGradient( ...
+        Tread, sys, sys_sequence, sys_wave, sys_lowPNS, ...
+        Ncycles, gwave_max, swave_max, gpe2CalPre_j, gro, adc, ...
+        physical_slew_max, centerWaveAroundNowave, ...
+        cosRampUpDuration, cosRampDownDuration, false, false);
 
-    allPostDur = [allPostDur, ... %#ok<AGROW>
+    eventsToRegister = {gpe2Pre_nowave{j}, gpe2Post_nowave{j}, ...
+        gpe2Pre_sin{j}, gpe2Post_sin{j}, gpe2CalPre_nowave{j}, ...
+        gpe2CalPost_nowave{j}, gpe2CalPre_sin{j}, gpe2CalPost_sin{j}};
+    for eventIndex = 1:numel(eventsToRegister)
+        eventsToRegister{eventIndex}.id = ...
+            seq.registerGradEvent(eventsToRegister{eventIndex});
+    end
+    gpe2Pre_nowave{j} = eventsToRegister{1};
+    gpe2Post_nowave{j} = eventsToRegister{2};
+    gpe2Pre_sin{j} = eventsToRegister{3};
+    gpe2Post_sin{j} = eventsToRegister{4};
+    gpe2CalPre_nowave{j} = eventsToRegister{5};
+    gpe2CalPost_nowave{j} = eventsToRegister{6};
+    gpe2CalPre_sin{j} = eventsToRegister{7};
+    gpe2CalPost_sin{j} = eventsToRegister{8};
+
+    imagePostDur = [imagePostDur, ... %#ok<AGROW>
         mr.calcDuration(gpe2Post_nowave{j}), ...
         mr.calcDuration(gpe2Post_sin{j})];
+    calibrationPostDur = [calibrationPostDur, ... %#ok<AGROW>
+        mr.calcDuration(gpe2CalPost_nowave{j}), ...
+        mr.calcDuration(gpe2CalPost_sin{j})];
 end
+
+sinOffsetInfo = sinOffsetInfoByLin{floor(N(ax.n3)/2)+1};
 
 % Common RF delay and inner TR cover every waveform mode used anywhere in
 % the integrated sequence.
-rf.delay = max([mr.calcDuration(groSp), allPostDur]);
+rf.delay = max([mr.calcDuration(groSp), imagePostDur]);
 TRinner = mr.calcDuration(rf) + mr.calcDuration(gro1);
 TE = mr.calcDuration(rf) - (rf.delay + mr.calcRfCenter(rf)) ...
     + adc.delay + adc.dwell*(adc.numSamples/2+0.5);
@@ -426,10 +581,10 @@ end
 
 % Calibration mode tables. A mode that does not belong to an axis uses that
 % axis's no-wave event.
-gpe1PreByMode  = {gpe1Pre_nowave,  gpe1Pre_nowave,  gpe1Pre_cos};
-gpe1PostByMode = {gpe1Post_nowave, gpe1Post_nowave, gpe1Post_cos};
-gpe2PreByMode  = {gpe2Pre_nowave,  gpe2Pre_sin,     gpe2Pre_nowave};
-gpe2PostByMode = {gpe2Post_nowave, gpe2Post_sin,    gpe2Post_nowave};
+gpe1PreByMode  = {gpe1CalPre_nowave,  gpe1CalPre_nowave,  gpe1CalPre_cos};
+gpe1PostByMode = {gpe1CalPost_nowave, gpe1CalPost_nowave, gpe1CalPost_cos};
+gpe2PreByMode  = {gpe2CalPre_nowave,  gpe2CalPre_sin,     gpe2CalPre_nowave};
+gpe2PostByMode = {gpe2CalPost_nowave, gpe2CalPost_sin,    gpe2CalPost_nowave};
 
 % Register common invariant objects.
 gslSp.id = seq.registerGradEvent(gslSp);
@@ -485,6 +640,7 @@ for iZ = 1:N(ax.n2)
     lblPAR_img{iZ} = mr.makeLabel('SET', 'PAR', iZ-1);
 end
 lblECO_img = mr.makeLabel('SET', 'ECO', 0);
+lblAVGZero = mr.makeLabel('SET', 'AVG', 0);
 lblSET_img = mr.makeLabel('SET', 'SET', 0);
 lblRefOff  = mr.makeLabel('SET', 'REF', false);
 lblImaOff  = mr.makeLabel('SET', 'IMA', false);
@@ -557,7 +713,7 @@ for jBlock = 1:numel(imgBlocks)
             seq.addBlock(adc, gro1, ...
                 gpe1Pre_mpr{iGlobal}, gpe2Pre_mpr{jGlobal}, ...
                 lblPAR_img{iGlobal}, lblLIN_img{jGlobal}, lblECO_img, ...
-                lblSET_img, lblRefOff, lblImaOff);
+                lblAVGZero, lblSET_img, lblRefOff, lblImaOff);
             expectedPAR_img(end+1,1) = iGlobal-1; %#ok<SAGROW>
             expectedLIN_img(end+1,1) = jGlobal-1; %#ok<SAGROW>
         else
@@ -607,7 +763,7 @@ assert(adcCal.numSamples == adc.numSamples && ...
 % duration-padded shared spoiler/rewinder block. This keeps calibration TR
 % identical across no-wave, sine-wave, cosine-wave, dummy, settling, and
 % acquired repetitions.
-calibPostDurations = [mr.calcDuration(groSp), allPostDur];
+calibPostDurations = [mr.calcDuration(groSp), calibrationPostDur];
 calibPostBlockDur = ceil(max(calibPostDurations)/sys.gradRasterTime) ...
     * sys.gradRasterTime;
 calibRfBlockDur = mr.calcDuration(rfCal, gCalSs);
@@ -806,7 +962,7 @@ for p = 1:numel(calParts)
         seq.addBlock(adcCal, gro1, ...
             gpe1PreByMode{mode}{iPhys}, gpe2PreByMode{mode}{jPhys}, ...
             lblPAR_cal{row.iLocal}, lblLIN_cal{row.jLocal}, ...
-            lblSET_cal{p}, lblECO_cal, lblRefOn, lblImaOff);
+            lblSET_cal{p}, lblECO_cal, lblAVGZero, lblRefOn, lblImaOff);
         seq.addBlock(mr.makeDelay(calibPostBlockDur), groSp, ...
             gpe1PostByMode{mode}{iPhys}, gpe2PostByMode{mode}{jPhys});
     end
@@ -821,6 +977,7 @@ adc_lbl = seq.evalLabels('evolution', 'adc');
 assert(isfield(adc_lbl, 'SET'), 'SET label missing from ADC evolution.');
 assert(isfield(adc_lbl, 'REF'), 'REF label missing from ADC evolution.');
 assert(isfield(adc_lbl, 'IMA'), 'IMA label missing from ADC evolution.');
+assert(isfield(adc_lbl, 'AVG'), 'AVG label missing from ADC evolution.');
 
 expectedSET_cal = [calAcqTable.partID]';
 expectedPAR_cal = [calAcqTable.iLocal]' - 1;
@@ -841,6 +998,7 @@ assert(all(logical(adc_lbl.REF(:)) == expectedREF_all), ...
     'Combined REF routing mismatch.');
 assert(all(logical(adc_lbl.IMA(:)) == expectedIMA_all), ...
     'Combined IMA/PATRefAndIma routing mismatch.');
+assert(all(adc_lbl.AVG(:) == 0), 'Combined AVG routing mismatch.');
 
 % MPRAGE image checks.
 imgRange = 1:nMprageAdc;
@@ -975,7 +1133,14 @@ seq.setDefinition('MPRAGE_ETL_RealSlots', nImgRealSlots);
 seq.setDefinition('MPRAGE_ETL_DummySlots', nImgDummySlots);
 seq.setDefinition('MPRAGE_UseWaveCos', double(isUseWave_cos));
 seq.setDefinition('MPRAGE_UseWaveSin', double(isUseWave_sin));
+seq.setDefinition('MPRAGE_WaveCenteredOnNowave', ...
+    double(centerWaveAroundNowave));
 seq.setDefinition('MPRAGE_HasSeparateACS', 0);
+seq.setDefinition('ActiveWaveSlewLimit_Tms', physical_slew_max);
+seq.setDefinition('WaveRampSlewLimit_Tms', ...
+    physical_slew_max*lowPNS_slew_safety_margin);
+seq.setDefinition('NonWaveSlewLimit_Tms', ...
+    physical_slew_max*lowPNS_slew_safety_margin);
 
 % Calibration/refscan definitions.
 seq.setDefinition('Calibration_TRinner', calibTR);
@@ -992,6 +1157,26 @@ seq.setDefinition('Calibration_ReadoutSamples', adcCal.numSamples);
 seq.setDefinition('Calibration_WaveAmplitude_mTm', gwave_max);
 seq.setDefinition('Calibration_WaveSlew_Tms', swave_max);
 seq.setDefinition('Calibration_WaveCycles', Ncycles);
+seq.setDefinition('CalibrationWaveAmplitude_mTm', gwave_max);
+seq.setDefinition('CalibrationWaveSlew_Tms', swave_max);
+seq.setDefinition('CalibrationWaveCycles', Ncycles);
+seq.setDefinition('CalibrationWaveCenteredOnNowave', ...
+    double(centerWaveAroundNowave));
+seq.setDefinition('CalibrationWaveSinIdealKRadius_1pm', ...
+    sinOffsetInfo.idealKRadius);
+seq.setDefinition('CalibrationWaveSinRasterKRadius_1pm', ...
+    sinOffsetInfo.kRadius);
+seq.setDefinition('CalibrationWaveSinRawCenterMoment_1pm', ...
+    sinOffsetInfo.rawCenterMoment);
+seq.setDefinition('CalibrationWaveSinPreOffsetArea_1pm', ...
+    sinOffsetInfo.preArea);
+seq.setDefinition('CalibrationWaveSinPostOffsetArea_1pm', ...
+    sinOffsetInfo.postArea);
+seq.setDefinition('CalibrationWaveSinPreOffsetDuration', ...
+    sinOffsetInfo.preDuration);
+seq.setDefinition('CalibrationWaveSinPostOffsetDuration', ...
+    sinOffsetInfo.postDuration);
+seq.setDefinition('CalibrationKspaceOrdering', 'negative_to_positive');
 seq.setDefinition('Calibration_Ndummy', Ndummy);
 seq.setDefinition('Calibration_NsettlePerPart', NsettlePerPart);
 seq.setDefinition('Calibration_Ncalib1', Ncalib1);
@@ -1022,12 +1207,7 @@ for p = 1:numel(calParts)
 end
 
 %% Compact sequence filename
-% Keep every generated filename below the scanner interpreter's
-% 128-character limit, including the ".seq" extension.
-%
-% Example:
-% mprage_3d_wave_FOV192x256x256_res1x1x1_ETL192_R1-2_R2-3_...
-% os4_amp8_cyc10_SAG_prisma_v151.seq
+% Keep every generated filename at or below 100 characters including .seq.
 
 compactNum = @(x) strrep( ...
     strrep(sprintf('%.4g', x), '.', 'p'), ...
@@ -1037,33 +1217,24 @@ fov_mm = fov(:).' * 1e3;
 
 fovTokens = arrayfun(compactNum, fov_mm, ...
     'UniformOutput', false);
-resTokens = arrayfun(compactNum, res_mm, ...
-    'UniformOutput', false);
-
 fovString = strjoin(fovTokens, 'x');
-resString = strjoin(resTokens, 'x');
-
+if centerWaveAroundNowave
+    sineStateTag = 'sinctr';
+else
+    sineStateTag = 'sinzero';
+end
 seqBaseName = sprintf( ...
-    ['mprage_3d_wave_FOV%s_res%s_ETL%d_' ...
-     'R1-%d_R2-%d_os%d_amp%s_cyc%d_%s_%s'], ...
-    fovString, ...
-    resString, ...
-    ETLtarget, ...
-    R1, ...
-    R2, ...
-    ro_os, ...
-    compactNum(gwave_max), ...
-    Ncycles, ...
-    slOrientation, ...
-    sys_type);
+    ['mprage_wave_SAG_FOV%s_ETL%d_R%dx%d_os%d_A%s_C%d_%s_%s'], ...
+    fovString, ETLtarget, R1, R2, ro_os, gwave_name, Ncycles, ...
+    sineStateTag, sys_type);
 
 % Store the compact format-independent name in the sequence definition.
 seq.setDefinition('Name', seqBaseName);
 
 %% Write sequence
 % Save before optional PNS/CNS and forbidden-frequency checks.
-outDir_v141 = fullfile(out_path, 'generated_seq_v141');
-outDir_v151 = fullfile(out_path, 'generated_seq_v151');
+outDir_v141 = fullfile(out_path, 'diagnostics', 'invalid_v1.4.1');
+outDir_v151 = out_path;
 
 if write_v141_format && ~exist(outDir_v141, 'dir')
     mkdir(outDir_v141);
@@ -1076,15 +1247,14 @@ end
 fileName_v141 = [seqBaseName '_v141.seq'];
 fileName_v151 = [seqBaseName '_v151.seq'];
 
-% The scanner limit is strictly less than 128 characters.
-assert(numel(fileName_v141) < 128, ...
+assert(numel(fileName_v141) <= 100, ...
     ['The v141 sequence filename contains %d characters. ' ...
-     'It must contain fewer than 128 characters:\n%s'], ...
+     'It must contain at most 100 characters:\n%s'], ...
     numel(fileName_v141), fileName_v141);
 
-assert(numel(fileName_v151) < 128, ...
+assert(numel(fileName_v151) <= 100, ...
     ['The v151 sequence filename contains %d characters. ' ...
-     'It must contain fewer than 128 characters:\n%s'], ...
+     'It must contain at most 100 characters:\n%s'], ...
     numel(fileName_v151), fileName_v151);
 
 if write_v141_format
@@ -1107,7 +1277,7 @@ fprintf('Write to file (v151, %d characters):\n%s\n', ...
 % because non-Cartesian waveforms can trigger many restoreShape warnings.
 % Comment out the warning('off',...) / warning('on',...) lines if you want
 % to show those warnings.
-do_pns_check = promptYesNoFromWorkspace('do_pns_check', 'Perform PNS/CNS check?', false);
+do_pns_check = false;
 
 if do_pns_check
     if isempty(safe_pns_prediction_path) || ~exist(safe_pns_prediction_path, 'dir')
@@ -1143,8 +1313,7 @@ end
 % because non-Cartesian waveforms can trigger many restoreShape warnings.
 % Comment out the warning('off',...) / warning('on',...) lines if you want
 % to show those warnings.
-do_forbidden_frequency_check = promptYesNoFromWorkspace('do_forbidden_frequency_check', ...
-    'Perform forbidden-frequency check?', false);
+do_forbidden_frequency_check = false;
 
 if do_forbidden_frequency_check
     if isGEscanner

@@ -60,10 +60,9 @@ Depending on `write_v141_format`, outputs are written to one or both folders:
 
 These generated folders are ignored by Git.
 
-## High-slew parity-aware evaluation entry point
+## High-slew parity-aware wave cases
 
-`seq/mprage_3d_wave_with_flash_calibration_sag_high_slew_cases.m` is the
-separate sagittal evaluation source for the coupled C10/A12.732,
+The primary entry point is the sagittal high-slew source for the coupled C10/A12.732,
 C20/A6.3662, and C25/A5.093 mT/m cases. Set `Ncycles` to 10, 20, or 25 and
 set `centerWaveAroundNowave` to `false` (`sinzero`) or `true` (`sinctr`)
 before running it; the default is `sinzero`. The same case and centering state are used by the MPRAGE
