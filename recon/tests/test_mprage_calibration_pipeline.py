@@ -45,6 +45,35 @@ def _embed_center(array: np.ndarray, oversampling_factor: int) -> np.ndarray:
 class MprageCalibrationPipelineTests(unittest.TestCase):
     """Verify integration of corrected ACS processing with BART export."""
 
+    def test_integrated_bart_runner_uses_wrapper_defaults_and_skips_nifti(self) -> None:
+        """The default backend should invoke BART without running local CG-SENSE."""
+
+        with mock.patch.object(reconstruction.subprocess, "run") as run:
+            reconstruction._run_bart_reconstruction(
+                bart_input_folder=Path("inputs"),
+                bart_output_folder=Path("outputs"),
+                twix_file=Path("input.dat"),
+                seq_file=Path("input.seq"),
+                save_nifti=False,
+                save_nifti_phase=False,
+                nifti_out_folder=Path("nifti"),
+                nifti_sub=None,
+                nifti_suffix="MPRAGE",
+                nifti_axis_roles=("phase", "readout", "slice"),
+                nifti_axis_flips=(True, False, False),
+                twix_coord_system="LPS",
+                twix_inplane_rot_sign=-1.0,
+                twix_use_fov_for_voxel_size=False,
+                file_tag="",
+                yflip=-1,
+                zflip=-1,
+            )
+
+        command = run.call_args.args[0]
+        self.assertIn("--skip-nifti", command)
+        self.assertNotIn("--wave-options", command)
+        run.assert_called_once_with(command, check=True)
+
     def test_bart_calibration_uses_alias_free_logical_acs(self) -> None:
         """The exporter should crop image RO before compression and padding."""
 

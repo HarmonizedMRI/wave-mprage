@@ -105,14 +105,18 @@ The old `--data-folder` argument is not part of the direct-path interface. Suppl
 7. Estimate low-resolution ESPIRiT maps with the selected `3d` or `slice2d` calibration backend.
 8. Interpolate and normalize the sensitivity maps.
 9. For wave data, fit the FLASH projection phase deviation and construct the calibrated wave PSF.
-10. Run wave or no-wave CG-SENSE on CPU.
-11. Save `.npy` arrays, diagnostic plots, and optional NIfTI outputs.
+10. By default, export BART inputs and run `bart wave -w -f` (wavelet/FISTA).
+11. When `--reconstruction-backend sense` is explicitly selected, run the
+    legacy wave or no-wave CG-SENSE solver on CPU.
+12. Save backend-appropriate outputs, diagnostic plots, and optional NIfTI outputs.
 
 ## BART Wave-CAIPI input export
 
-Add `--save-bart-inputs` to a wave reconstruction to write BART-compatible
-`.hdr`/`.cfl` pairs under `<out>/bart_inputs` (or `bart_inputs_<tag>` when
-`--file-tag` is set).
+The default `--reconstruction-backend bart` writes BART-compatible `.hdr`/`.cfl`
+pairs under `<out>/bart_inputs` (or `bart_inputs_<tag>` when `--file-tag` is
+set), then reconstructs under the matching `bart_output` directory. With the
+explicit SENSE backend, `--save-bart-inputs` remains available as export-only
+compatibility behavior.
 
 | Basename | BART shape | Contents |
 |---|---|---|
@@ -138,7 +142,9 @@ recon/bart/run_wave_recon.sh \
 
 Options inside the `--ecalib-options` and `--wave-options` sections are passed
 unchanged to the corresponding BART commands. The helper prints each complete
-command before running it. If `--nifti-output` is omitted, converted files are
+command before running it. If `--wave-options` is omitted, it uses `-w -f`.
+Pass `--skip-nifti` to stop after BART reconstruction. Otherwise, if
+`--nifti-output` is omitted, converted files are
 written to `BART_OUTPUT/nifti`; pass the option only to override that location.
 Conversion uses `python` from the active Conda environment or virtual
 environment. Set `PYTHON_BIN` to select a different interpreter. To skip
@@ -241,7 +247,8 @@ The current implementation does not move the full reconstruction to GPU.
 | Coil-compression application | CPU / PyTorch tensor |
 | Native `3d` ESPIRiT calibration | selectable SigPy CPU or GPU |
 | Parallel `slice2d` ESPIRiT calibration | CPU process workers |
-| Wave and no-wave CG-SENSE | CPU / PyTorch tensor |
+| Default Wave reconstruction | BART wavelet/FISTA |
+| Explicit legacy Wave/no-wave CG-SENSE | CPU / PyTorch tensor |
 
 ### ESPIRiT calibration mode
 
@@ -481,5 +488,6 @@ The output folder may contain:
 - CSM magnitude and phase plots
 - coil-compressed MPRAGE k-space
 - PSF phase-fit arrays and plots
-- wave or no-wave CG-SENSE image as `.npy`
+- BART Wave-CAIPI CFL images by default
+- wave or no-wave CG-SENSE image as `.npy` with the explicit SENSE backend
 - optional magnitude and phase NIfTI files and JSON sidecars

@@ -11,10 +11,9 @@ Description:
     file and Pulseq sequence are used for the image data, integrated refscan
     ACS data, and integrated wave PSF calibration projections.
 
-    The reconstruction pipeline uses coil compression, ESPIRiT coil
-    sensitivity estimation, and CG-SENSE. For wave data, the calibrated PSF is
-    estimated from the integrated FLASH-calibration refscan blocks and then
-    used in the wave CG-SENSE operator.
+    The default reconstruction pipeline exports calibrated Wave-CAIPI inputs
+    and runs BART with wavelet regularization and FISTA. The legacy local
+    CG-SENSE solver remains available as an explicit backend.
 
 Notes:
     - This script assumes the integrated refscan layout uses the first four
@@ -36,6 +35,7 @@ import pypulseq as pp
 import platform
 import os
 import argparse
+import subprocess
 from pathlib import Path
 
 try:
@@ -116,6 +116,7 @@ def main():
     psf_fit_kx_min = cfg["psf_fit_kx_min"]
     psf_fit_kx_max = cfg["psf_fit_kx_max"]
     save_bart_inputs = cfg["save_bart_inputs"]
+    reconstruction_backend = cfg["reconstruction_backend"]
 
     seq = pp.Sequence()
     seq.read(mprage_seq_file, remove_duplicates=False)
@@ -277,6 +278,32 @@ def main():
                 },
             )
             print(f"Saved BART Wave-CAIPI inputs: {manifest_path}")
+
+            if reconstruction_backend == "bart":
+                bart_output_folder = Path(out_folder) / (
+                    "bart_output" + (f"_{bart_tag}" if bart_tag else "")
+                )
+                _run_bart_reconstruction(
+                    bart_input_folder=bart_folder,
+                    bart_output_folder=bart_output_folder,
+                    twix_file=mprage_data_file,
+                    seq_file=mprage_seq_file,
+                    save_nifti=save_nifti,
+                    save_nifti_phase=save_nifti_phase,
+                    nifti_out_folder=nifti_out_folder,
+                    nifti_sub=nifti_sub,
+                    nifti_suffix=nifti_suffix,
+                    nifti_axis_roles=nifti_axis_roles,
+                    nifti_axis_flips=nifti_axis_flips,
+                    twix_coord_system=twix_coord_system,
+                    twix_inplane_rot_sign=twix_inplane_rot_sign,
+                    twix_use_fov_for_voxel_size=twix_use_fov_for_voxel_size,
+                    file_tag=file_tag,
+                    yflip=yflip,
+                    zflip=zflip,
+                )
+                print(f"Saved BART Wave-CAIPI reconstruction under: {bart_output_folder}")
+                return
 
         psf_to_use = psf_calib.clone()
         # psf_to_use = psf_theory.clone()
@@ -1934,6 +1961,17 @@ def _parse_cli_args():
             "are compatibility aliases."
         ),
     )
+    parser.add_argument(
+        "--reconstruction-backend",
+        "--backend",
+        choices=("bart", "sense"),
+        default="bart",
+        help=(
+            "Reconstruction solver. Default 'bart' exports BART inputs and "
+            "runs wavelet/FISTA; 'sense' explicitly selects the legacy local "
+            "CG-SENSE solver."
+        ),
+    )
 
     parser.add_argument(
         "--file-tag",
@@ -1996,8 +2034,8 @@ def _parse_cli_args():
         "--save-bart-inputs",
         action="store_true",
         help=(
-            "Export BART CFL inputs under <out>/bart_inputs[_tag]. This is "
-            "available for wave acquisitions only."
+            "Also export BART CFL inputs when using the SENSE backend. The "
+            "default BART backend always exports them."
         ),
     )
     parser.add_argument("--nifti-out-folder", default=None,
@@ -2154,6 +2192,80 @@ def _save_npy(path_without_ext, array, label):
     return out_path
 
 
+def _run_bart_reconstruction(
+    *,
+    bart_input_folder,
+    bart_output_folder,
+    twix_file,
+    seq_file,
+    save_nifti,
+    save_nifti_phase,
+    nifti_out_folder,
+    nifti_sub,
+    nifti_suffix,
+    nifti_axis_roles,
+    nifti_axis_flips,
+    twix_coord_system,
+    twix_inplane_rot_sign,
+    twix_use_fov_for_voxel_size,
+    file_tag,
+    yflip,
+    zflip,
+):
+    """Run the repository BART wrapper with its wavelet/FISTA defaults."""
+
+    wrapper = Path(__file__).resolve().parent / "bart" / "run_wave_recon.sh"
+    command = [
+        "bash",
+        str(wrapper),
+        "--bart-input",
+        str(bart_input_folder),
+        "--bart-output",
+        str(bart_output_folder),
+        "--maps-source",
+        "bart",
+        "--twix",
+        str(twix_file),
+        "--seq",
+        str(seq_file),
+    ]
+    if not save_nifti:
+        command.append("--skip-nifti")
+    else:
+        command.extend(["--nifti-output", str(nifti_out_folder)])
+        if save_nifti_phase:
+            command.append("--save-phase")
+        command.extend(
+            [
+                "--nifti-options",
+                "--file-tag",
+                str(file_tag),
+                "--nifti-suffix",
+                str(nifti_suffix),
+                "--nifti-axis-roles",
+                *[str(value) for value in nifti_axis_roles],
+                "--nifti-axis-flips",
+                *[str(bool(value)).lower() for value in nifti_axis_flips],
+                "--twix-coord-system",
+                str(twix_coord_system),
+                "--twix-inplane-rot-sign",
+                str(twix_inplane_rot_sign),
+                "--yflip",
+                str(yflip),
+                "--zflip",
+                str(zflip),
+            ]
+        )
+        if nifti_sub:
+            command.extend(["--nifti-sub", str(nifti_sub)])
+        if twix_use_fov_for_voxel_size:
+            command.append("--twix-use-fov-for-voxel-size")
+        command.append("--end-nifti-options")
+
+    print("Running BART Wave-CAIPI reconstruction with default wavelet/FISTA...")
+    subprocess.run(command, check=True)
+
+
 def _collect_runtime_config():
     """Collect runtime paths/tags from CLI args, existing globals, or prompts."""
     cli = _parse_cli_args()
@@ -2208,10 +2320,18 @@ def _collect_runtime_config():
         Nacs=mode_nacs,
         slice_orientation=mode_orientation,
     )
+    reconstruction_backend_value = str(cli.reconstruction_backend).strip().lower()
     save_bart_inputs_value = bool(
-        cli.save_bart_inputs or globals().get("save_bart_inputs", False)
+        reconstruction_backend_value == "bart"
+        or cli.save_bart_inputs
+        or globals().get("save_bart_inputs", False)
     )
     if save_bart_inputs_value and tag_wave_value != "wave":
+        if reconstruction_backend_value == "bart":
+            raise ValueError(
+                "The default BART backend requires a wave acquisition. Use "
+                "--reconstruction-backend sense for no-wave data."
+            )
         raise ValueError("--save-bart-inputs requires a wave acquisition.")
 
     reuse_coil_calib_value = bool(cli.reuse_coil_calib or globals().get("reuse_coil_calib", False))
@@ -2260,7 +2380,11 @@ def _collect_runtime_config():
     yflip_value = _get_optional_int("yflip", cli.yflip, default=-1, allowed_values=(-1, 1))
     zflip_value = _get_optional_int("zflip", cli.zflip, default=-1, allowed_values=(-1, 1))
 
-    save_nifti_value = bool(cli.save_nifti or globals().get("save_nifti", False))
+    save_nifti_value = bool(
+        cli.save_nifti
+        or cli.save_nifti_phase
+        or globals().get("save_nifti", False)
+    )
     save_nifti_phase_value = bool(cli.save_nifti_phase or globals().get("save_nifti_phase", False))
 
     nifti_out_folder_value = cli.nifti_out_folder
@@ -2341,6 +2465,7 @@ def _collect_runtime_config():
     print(f"  out: {out_folder_value}")
     print(f"  file_tag:          {file_tag_value}")
     print(f"  reconstruction:    {tag_wave_value}")
+    print(f"  backend:           {reconstruction_backend_value}")
     print(f"  reuse_coil_calib:  {reuse_coil_calib_value}")
     print("  coil compression: CPU")
     print(f"  ESPIRiT request:  {espirit_device_value} (GPU index {espirit_gpu_index_value})")
@@ -2354,7 +2479,10 @@ def _collect_runtime_config():
         print("  SAG RO support:   auto whole-plane guard, S-I, padding=3")
     else:
         print("  ESPIRiT workers:  n/a (native 3D backend)")
-    print("  CG-SENSE:         CPU")
+    if reconstruction_backend_value == "sense":
+        print("  CG-SENSE:         CPU (explicit legacy backend)")
+    else:
+        print("  BART solver:      wavelet/FISTA (-w -f)")
     print(f"  yflip/zflip:       {yflip_value}/{zflip_value}")
     print(f"  save_nifti:        {save_nifti_value}")
     print(f"  save_bart_inputs:  {save_bart_inputs_value}")
@@ -2374,6 +2502,7 @@ def _collect_runtime_config():
         "mprage_seq_file": mprage_seq_value,
         "file_tag": file_tag_value,
         "tag_wave": tag_wave_value,
+        "reconstruction_backend": reconstruction_backend_value,
         "reuse_coil_calib": reuse_coil_calib_value,
         "espirit_device": espirit_device_value,
         "espirit_gpu_index": espirit_gpu_index_value,

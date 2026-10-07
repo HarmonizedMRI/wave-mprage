@@ -63,7 +63,8 @@ The current execution model is:
 |---|---|
 | Coil-compression matrix estimation and application | CPU |
 | ESPIRiT sensitivity-map calibration | Native 3D on CPU/GPU, or optional CPU-parallel `slice2d` |
-| Wave/no-wave CG-SENSE | CPU |
+| Default Wave reconstruction | BART wavelet/FISTA (`-w -f`) |
+| Explicit legacy Wave/no-wave CG-SENSE | CPU |
 
 A GPU is optional. The default `--espirit-calib-mode 3d` uses the native joint 3D SigPy calibration; `--espirit-device auto` uses a compatible GPU when CuPy can access one and otherwise falls back to CPU. The optional `--espirit-calib-mode slice2d` backend is CPU-only and parallelizes independent hybrid-space 2D calibrations across logical readout positions. For acquisitions with more than 32 receive channels, consider CPU calibration when the available CPU memory is more suitable than the GPU resources or when GPU calibration is unstable.
 
@@ -200,13 +201,16 @@ detects sustained coefficient corruption. Supply both `--psf-fit-kx-min` and
 [PSF coefficient processing](docs/reconstruction.md#psf-coefficient-processing)
 for the selection, validation, diagnostics, and failure contracts.
 
-Add `--save-bart-inputs` to export the calibrated PSF, coil-compressed
-k-space, sensitivity maps, and integrated ACS as BART CFL pairs. The companion
-`recon/bart/run_wave_recon.sh` script runs BART `ecalib` and `wave`; see
+Wave acquisitions export the calibrated PSF, coil-compressed k-space,
+sensitivity maps, and integrated ACS as BART CFL pairs by default, then run
+BART `ecalib` and wavelet/FISTA reconstruction. Select
+`--reconstruction-backend sense` only when the traditional local CG-SENSE
+solver is required. The companion `recon/bart/run_wave_recon.sh` script can
+also be run independently; see
 [Reconstruction](docs/reconstruction.md#bart-wave-caipi-input-export) for the
 exact dimensions and command. It converts results with `python` from the active
 Conda environment or virtual environment, and writes NIfTIs to
-`BART_OUTPUT/nifti` unless an override is supplied.
+`BART_OUTPUT/nifti` unless `--skip-nifti` or an override is supplied.
 
 Force CPU ESPIRiT while explicitly requiring wave reconstruction:
 
