@@ -178,7 +178,14 @@ TI    = 1.1;
 TRout = 2.5;
 R1 = 1;                           % acceleration along ax.d2 / PAR
 R2 = 3;                           % acceleration along ax.d3 / LIN
-ETLtarget = 256;
+
+etlSearch = struct;
+etlSearch.nominalETL             = 256;
+etlSearch.minETL                 = 160;
+etlSearch.maxETL                 = 256;
+etlSearch.minCommonDivisor       = 16;
+etlSearch.preferredDummyFraction = 0.05;
+etlSearch.hardDummyFraction      = 0.10;
 
 etlSeg = struct;
 etlSeg.sMin      = 16;
@@ -194,8 +201,6 @@ isUseWave_sin = true;
 
 assert(R1 >= 1 && R1 == round(R1), 'R1 must be a positive integer.');
 assert(R2 >= 1 && R2 == round(R2), 'R2 must be a positive integer.');
-assert(ETLtarget >= 1 && ETLtarget == round(ETLtarget), ...
-    'ETLtarget must be a positive integer.');
 
 %% System limits
 % sys = mr.opts('MaxGrad',28,'GradUnit','mT/m',...
@@ -603,14 +608,24 @@ gro1.id  = seq.registerGradEvent(gro1);
 nPE1Img = numel(PE1_img);
 nPE2Img = numel(PE2_img);
 
-if nPE1Img > ETLtarget
-    error('Sampled MPRAGE PE1 count (%d) exceeds ETLtarget (%d).', ...
-        nPE1Img, ETLtarget);
-end
+inv180TailToEnd = mr.calcDuration(rf180) ...
+    - mr.calcRfCenter(rf180) - rf180.delay;
+rfStartToCenter = rf.delay + mr.calcRfCenter(rf);
+etlTiming = struct;
+etlTiming.TI = TI;
+etlTiming.TRout = TRout;
+etlTiming.TRinner = TRinner;
+etlTiming.invTailToEnd = inv180TailToEnd;
+etlTiming.rfStartToCenter = rfStartToCenter;
+etlTiming.invDuration = mr.calcDuration(rf180);
+etlTiming.spoilerDuration = mr.calcDuration(gslSp);
+etlTiming.blockRaster = sys.blockDurationRaster;
 
-etlPlan_img = chooseFixedETLPlan(nPE1Img, ETLtarget, etlSeg);
+[ETLtarget, etlPlan_img, etlChoice] = ...
+    chooseAdaptiveMprageETLPlan(nPE1Img, nPE2Img, ...
+        etlSearch, etlSeg, etlTiming);
 imgPairsGlobal = makePEPairList(PE1_img, PE2_img, []);
-centerSlotTarget = floor(ETLtarget/2) + 1;
+centerSlotTarget = etlChoice.centerSlot;
 imgBlocks = buildSegmentedFixedETLBlocks(PE1_img, PE2_img, ...
     ETLtarget, etlPlan_img, centerPE1LineIdx, centerPE2LineIdx, ...
     centerSlotTarget);
@@ -618,13 +633,14 @@ imgBlocks = buildSegmentedFixedETLBlocks(PE1_img, PE2_img, ...
 assertGlobalCenterAtTarget(imgBlocks, centerPE1LineIdx, ...
     centerPE2LineIdx, centerSlotTarget, 'MPRAGE IMG');
 
-inv180TailToEnd = mr.calcDuration(rf180) ...
-    - mr.calcRfCenter(rf180) - rf180.delay;
-rfStartToCenter = rf.delay + mr.calcRfCenter(rf);
-
 fprintf(['MPRAGE: R1=%d -> %d/%d PE1 lines; R2=%d -> %d/%d PE2 lines; ', ...
          'ETL=%d.\n'], ...
     R1, nPE1Img, N(ax.n2), R2, nPE2Img, N(ax.n3), ETLtarget);
+fprintf(['MPRAGE adaptive ETL: nominal=%d, selected=%d, search=%d, ', ...
+         'reason=%s, gcd=%d, total dummy=%.4f%%, candidates=%d.\n'], ...
+    etlChoice.nominalETL, ETLtarget, etlChoice.searchTriggered, ...
+    etlChoice.triggerReason, etlChoice.commonDivisor, ...
+    100*etlChoice.dummyFraction, etlChoice.candidatesEvaluated);
 fprintf(['MPRAGE ETL plan: mode=%s, segment=%d, segments/PE2=%d, ', ...
          'segments/block=%d, filler/PE2=%d, efficiency=%.4f.\n'], ...
     etlPlan_img.mode, etlPlan_img.s, etlPlan_img.K, etlPlan_img.P, ...
@@ -1122,8 +1138,18 @@ seq.setDefinition('MPRAGE_PE2_R', R2);
 seq.setDefinition('MPRAGE_PE1_ImgLines', nPE1Img);
 seq.setDefinition('MPRAGE_PE2_ImgLines', nPE2Img);
 seq.setDefinition('MPRAGE_ImageADCs', nMprageAdc);
+seq.setDefinition('MPRAGE_ETL_Nominal', etlChoice.nominalETL);
+seq.setDefinition('MPRAGE_ETL_Min', etlChoice.minETL);
+seq.setDefinition('MPRAGE_ETL_Max', etlChoice.maxETL);
 seq.setDefinition('MPRAGE_ETL_Target', ETLtarget);
 seq.setDefinition('MPRAGE_ETL_CenterSlot0', centerSlotTarget-1);
+seq.setDefinition('MPRAGE_ETL_SearchTriggered', ...
+    double(etlChoice.searchTriggered));
+seq.setDefinition('MPRAGE_ETL_TriggerReason', etlChoice.triggerReason);
+seq.setDefinition('MPRAGE_ETL_CommonDivisor', ...
+    etlChoice.commonDivisor);
+seq.setDefinition('MPRAGE_ETL_TotalEfficiency', ...
+    etlChoice.totalEfficiency);
 seq.setDefinition('MPRAGE_ETL_Mode', etlPlan_img.mode);
 seq.setDefinition('MPRAGE_ETL_SegLen', etlPlan_img.s);
 seq.setDefinition('MPRAGE_ETL_SegmentsPerKy', etlPlan_img.K);
