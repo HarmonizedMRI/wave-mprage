@@ -6,7 +6,9 @@ function [selectedETL, selectedPlan, info] = chooseAdaptiveMprageETLPlan( ...
     % The existing fixed-ETL planner is evaluated first at nominalETL. An
     % outer search over [minETL,maxETL] is triggered only when the nominal
     % plan has a small common divisor, falls back to dummy mode, exceeds the
-    % preferred total dummy fraction, or violates exact TI/TRout timing.
+    % preferred total dummy fraction, or violates exact TI/TRout timing. If
+    % sampled PAR exceeds a candidate ETL, PAR remains the inner direction
+    % and is segmented across multiple inversion blocks.
 
     validatePositiveInteger(M, 'M');
     validatePositiveInteger(L, 'L');
@@ -48,8 +50,11 @@ function [selectedETL, selectedPlan, info] = chooseAdaptiveMprageETLPlan( ...
         planOpts, timing);
     triggerReasons = {};
     if ~nominal.exists
-        triggerReasons{end+1} = 'nominal_below_sampled_PAR';
+        triggerReasons{end+1} = 'nominal_no_feasible_segmentation';
     else
+        if M > searchOpts.nominalETL
+            triggerReasons{end+1} = 'sampled_PAR_exceeds_nominal';
+        end
         if nominal.commonDivisor < searchOpts.minCommonDivisor
             triggerReasons{end+1} = 'small_common_divisor';
         end
@@ -123,12 +128,17 @@ end
 function candidate = evaluateCandidate(M, L, E, planOpts, timing)
     candidate = emptyCandidate();
     if E < M
-        return;
+        plan = chooseLongParFixedETLPlan(M, E, planOpts);
+        if isempty(plan)
+            return;
+        end
+    else
+        plan = chooseFixedETLPlan(M, E, planOpts);
     end
 
     candidate.exists = true;
     candidate.E = E;
-    candidate.plan = chooseFixedETLPlan(M, E, planOpts);
+    candidate.plan = plan;
     candidate.centerSlot = floor(E/2) + 1;
     candidate.commonDivisor = gcd(M, E);
     candidate.realSlots = M * L;
@@ -154,6 +164,63 @@ function candidate = evaluateCandidate(M, L, E, planOpts, timing)
         candidate.tiDelay >= timing.spoilerDuration - tol && ...
         candidate.troutDelay >= -tol;
     candidate.rankClass = inf;
+end
+
+function plan = chooseLongParFixedETLPlan(M, E, opts)
+    % Split one sampled PAR line over multiple inversion blocks when M>E.
+    % buildSegmentedFixedETLBlocks already supports this K>P layout. Every
+    % residue-class segment must contain a filler slot so a block without a
+    % real PAR-center sample can still place a dummy at the prescribed TI.
+
+    divE = find(mod(E, 1:E) == 0);
+    candidates = struct('s', {}, 'K', {}, 'P', {}, 'F', {}, ...
+        'saved', {}, 'efficiency', {});
+
+    for ii = 1:numel(divE)
+        s = divE(ii);
+        K = ceil(M / s);
+        P = E / s;
+        F = K*s - M;
+
+        isValid = ...
+            (K > P) && ...
+            (s >= opts.sMin) && ...
+            (K <= opts.KMax) && ...
+            (P <= opts.PMax) && ...
+            (F / (K*s) <= opts.fillerMax) && ...
+            (s > ceil(M / K));
+
+        if isValid
+            c = numel(candidates) + 1;
+            candidates(c).s = s;
+            candidates(c).K = K;
+            candidates(c).P = P;
+            candidates(c).F = F;
+            candidates(c).saved = E - K*s;
+            candidates(c).efficiency = M / (K*s);
+        end
+    end
+
+    if isempty(candidates)
+        plan = [];
+        return;
+    end
+
+    score = zeros(1, numel(candidates));
+    for c = 1:numel(candidates)
+        score(c) = candidates(c).s*1e6 ...
+            + candidates(c).efficiency*1e3 - candidates(c).P;
+    end
+    [~, bestIdx] = max(score);
+    best = candidates(bestIdx);
+
+    plan.mode = 'segmented';
+    plan.s = best.s;
+    plan.K = best.K;
+    plan.P = best.P;
+    plan.F = best.F;
+    plan.saved = best.saved;
+    plan.efficiency = best.efficiency;
 end
 
 function rankClass = candidateClass(candidate, searchOpts)
