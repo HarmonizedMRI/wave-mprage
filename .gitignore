@@ -220,3 +220,5 @@ __marimo__/
 # User-defined
 .DS_Store
 *path_settings.json
+*temp*
+/evaluation/output/

@@ -60,6 +60,27 @@ Depending on `write_v141_format`, outputs are written to one or both folders:
 
 These generated folders are ignored by Git.
 
+## High-slew parity-aware evaluation entry point
+
+`seq/mprage_3d_wave_with_flash_calibration_sag_high_slew_cases.m` is the
+separate sagittal evaluation source for the coupled C10/A12.732,
+C20/A6.3662, and C25/A5.093 mT/m cases. Set `Ncycles` to 10, 20, or 25 and
+set `centerWaveAroundNowave` to `false` (`sinzero`) or `true` (`sinctr`)
+before running it. The same case and centering state are used by the MPRAGE
+image and appended FLASH calibration.
+
+This source uses a 180 T/m/s physical envelope only for active sine/cosine
+samples. Wave ramps, PE, spoilers, rephasers, and sine-offset events are
+designed against the 63 T/m/s low-PNS envelope. Generated v1.5.1 files are
+written below `evaluation/output/v1.5.1/high_slew_wave_mprage/`, separate
+from MATLAB source files. Run
+`evaluation/validate_wave_mprage_high_slew_cases.m` after generating all six
+case/state combinations.
+
+PNS and forbidden-frequency checks are deliberately outside that validator.
+Passing its timing, trajectory, labels, and hardware-envelope checks does not
+make a generated file scanner-safe.
+
 ## Scanner protocol UI recommendations
 
 Apply the following receive-coil and geometry settings when prescribing the scan:
