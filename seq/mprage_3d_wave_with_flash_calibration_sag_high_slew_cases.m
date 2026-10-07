@@ -128,7 +128,7 @@ end
 % true adds the parity-aware pre/post moment that centers the corkscrew.
 if ~exist('centerWaveAroundNowave', 'var') || ...
         isempty(centerWaveAroundNowave)
-    centerWaveAroundNowave = true;
+    centerWaveAroundNowave = false;
 end
 
 %% FLASH calibration-only parameters
