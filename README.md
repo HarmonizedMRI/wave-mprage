@@ -55,18 +55,21 @@ Optional scanner-safety checks can use Safe PNS Prediction, a scanner `.asc` fil
 
 - Python 3.11
 - CPU reconstruction environment defined in `pyproject.toml`
-- Optional NVIDIA GPU and CUDA 12-compatible CuPy for faster ESPIRiT calibration
+- GPU-enabled BART and an NVIDIA GPU for the default `bart wave -g` path
+- Optional CUDA 12-compatible CuPy only for GPU SigPy ESPIRiT in the explicit SENSE path
 
 The current execution model is:
 
 | Step | Device |
 |---|---|
 | Coil-compression matrix estimation and application | CPU |
-| ESPIRiT sensitivity-map calibration | Native 3D on CPU/GPU, or optional CPU-parallel `slice2d` |
-| Default Wave reconstruction | BART wavelet/FISTA (`-w -f`) |
+| Default sensitivity-map calibration | BART `ecalib`; SigPy ESPIRiT is skipped |
+| Default Wave reconstruction | BART GPU wavelet/FISTA (`-w -f -g`) |
 | Explicit legacy Wave/no-wave CG-SENSE | CPU |
 
-A GPU is optional. The default `--espirit-calib-mode 3d` uses the native joint 3D SigPy calibration; `--espirit-device auto` uses a compatible GPU when CuPy can access one and otherwise falls back to CPU. The optional `--espirit-calib-mode slice2d` backend is CPU-only and parallelizes independent hybrid-space 2D calibrations across logical readout positions. For acquisitions with more than 32 receive channels, consider CPU calibration when the available CPU memory is more suitable than the GPU resources or when GPU calibration is unstable.
+The default BART backend requires a BART build with GPU support because it
+invokes `bart wave -w -f -g`. SigPy ESPIRiT options apply only when
+`--reconstruction-backend sense` is selected.
 
 ## Clone
 
@@ -201,9 +204,9 @@ detects sustained coefficient corruption. Supply both `--psf-fit-kx-min` and
 [PSF coefficient processing](docs/reconstruction.md#psf-coefficient-processing)
 for the selection, validation, diagnostics, and failure contracts.
 
-Wave acquisitions export the calibrated PSF, coil-compressed k-space,
-sensitivity maps, and integrated ACS as BART CFL pairs by default, then run
-BART `ecalib` and wavelet/FISTA reconstruction. Select
+Wave acquisitions export the calibrated PSF, coil-compressed k-space, and
+integrated ACS as BART CFL pairs by default. They skip SigPy ESPIRiT, run BART
+`ecalib`, and then run GPU wavelet/FISTA reconstruction. Select
 `--reconstruction-backend sense` only when the traditional local CG-SENSE
 solver is required. The companion `recon/bart/run_wave_recon.sh` script can
 also be run independently; see

@@ -102,10 +102,11 @@ The old `--data-folder` argument is not part of the direct-path interface. Suppl
 4. Load the integrated ACS block from the final `refscan` SET.
 5. Estimate a 32-to-12 coil-compression matrix on CPU.
 6. Apply coil compression on CPU.
-7. Estimate low-resolution ESPIRiT maps with the selected `3d` or `slice2d` calibration backend.
-8. Interpolate and normalize the sensitivity maps.
+7. For the default BART backend, skip SigPy ESPIRiT and export the compressed
+   integrated ACS for `bart ecalib`.
+8. Only for the explicit SENSE backend, estimate and interpolate SigPy ESPIRiT maps.
 9. For wave data, fit the FLASH projection phase deviation and construct the calibrated wave PSF.
-10. By default, export BART inputs and run `bart wave -w -f` (wavelet/FISTA).
+10. By default, run `bart ecalib`, then `bart wave -w -f -g` (GPU wavelet/FISTA).
 11. When `--reconstruction-backend sense` is explicitly selected, run the
     legacy wave or no-wave CG-SENSE solver on CPU.
 12. Save backend-appropriate outputs, diagnostic plots, and optional NIfTI outputs.
@@ -122,7 +123,7 @@ compatibility behavior.
 |---|---|---|
 | `wave_kspace` | `(Nx_os, Ny, Nz, Ncc, 1)` | Coil-compressed acquired k-space |
 | `psf` | `(Nx_os, Ny, Nz, 1, 1)` | Calibrated wave PSF |
-| `coil_sens` | `(Nx, Ny, Nz, Ncc, 1)` | Sensitivity maps from this reconstruction |
+| `coil_sens` | `(Nx, Ny, Nz, Ncc, 1)` | Optional; exported only from the explicit SENSE path for `--maps-source existing` |
 | `kspace_calib` | `(Nx, Ny, Nz, Ncc)` | Coil-compressed, centered integrated ACS |
 
 The companion script runs BART ESPIRiT calibration, Wave-CAIPI reconstruction,
@@ -142,7 +143,7 @@ recon/bart/run_wave_recon.sh \
 
 Options inside the `--ecalib-options` and `--wave-options` sections are passed
 unchanged to the corresponding BART commands. The helper prints each complete
-command before running it. If `--wave-options` is omitted, it uses `-w -f`.
+command before running it. If `--wave-options` is omitted, it uses `-w -f -g`.
 Pass `--skip-nifti` to stop after BART reconstruction. Otherwise, if
 `--nifti-output` is omitted, converted files are
 written to `BART_OUTPUT/nifti`; pass the option only to override that location.
@@ -245,9 +246,9 @@ The current implementation does not move the full reconstruction to GPU.
 |---|---|
 | Coil-compression estimation | CPU / NumPy and SciPy |
 | Coil-compression application | CPU / PyTorch tensor |
-| Native `3d` ESPIRiT calibration | selectable SigPy CPU or GPU |
-| Parallel `slice2d` ESPIRiT calibration | CPU process workers |
-| Default Wave reconstruction | BART wavelet/FISTA |
+| Default sensitivity-map calibration | BART `ecalib` |
+| Native `3d` / `slice2d` SigPy ESPIRiT | Explicit SENSE backend only |
+| Default Wave reconstruction | BART GPU wavelet/FISTA |
 | Explicit legacy Wave/no-wave CG-SENSE | CPU / PyTorch tensor |
 
 ### ESPIRiT calibration mode

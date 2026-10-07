@@ -158,6 +158,36 @@ def main():
             f"{nifti_voxel_size_mm[2]:g} mm"
         )
 
+    logical_acs = None
+    if reconstruction_backend == "bart":
+        print("Preparing coil compression for BART; skipping SigPy ESPIRiT...")
+        Wcc, logical_acs, Ncoil_ref = load_or_generate_coil_compression_for_bart(
+            mprage_data_file=mprage_data_file,
+            os_factor=os_factor,
+            out_folder=out_folder,
+            file_tag=file_tag,
+            Nacs=nacs,
+            reuse_coil_calib=reuse_coil_calib,
+        )
+        csm_full_cc_np = None
+    else:
+        print("Preparing coil compression matrix and coil sensitivity maps...")
+        Wcc, csm_full_cc_np, Ncoil_ref = load_or_generate_coil_sens(
+            mprage_data_file=mprage_data_file,
+            Ny=Ny,
+            Nz=Nz,
+            os_factor=os_factor,
+            out_folder=out_folder,
+            file_tag=file_tag,
+            Nacs=nacs,
+            reuse_coil_calib=reuse_coil_calib,
+            espirit_device=espirit_device,
+            espirit_gpu_index=espirit_gpu_index,
+            espirit_crop=espirit_crop,
+            espirit_calib_mode=espirit_calib_mode,
+            espirit_cpu_workers=espirit_cpu_workers,
+        )
+
     print("Importing image data from integrated TWIX file...")
     img = load_img(mprage_data_file)
     if not torch.is_tensor(img):
@@ -176,22 +206,6 @@ def main():
     )
     Ncoil = int(img.shape[-1])
 
-    print("Preparing coil compression matrix and coil sensitivity maps...")
-    Wcc, csm_full_cc_np, Ncoil_ref = load_or_generate_coil_sens(
-        mprage_data_file=mprage_data_file,
-        Ny=Ny,
-        Nz=Nz,
-        os_factor=os_factor,
-        out_folder=out_folder,
-        file_tag=file_tag,
-        Nacs=nacs,
-        reuse_coil_calib=reuse_coil_calib,
-        espirit_device=espirit_device,
-        espirit_gpu_index=espirit_gpu_index,
-        espirit_crop=espirit_crop,
-        espirit_calib_mode=espirit_calib_mode,
-        espirit_cpu_workers=espirit_cpu_workers,
-    )
     if Ncoil_ref != Ncoil:
         raise ValueError(
             f"Image/refscan coil-count mismatch: image data has {Ncoil} coils, "
@@ -199,33 +213,22 @@ def main():
         )
 
     print(f'Importing data, Ry={Ry}, Rz={Rz}')
-    kspace_echo = torch.zeros((Nx_os, Ny, Nz, Ncoil), dtype=torch.cfloat)
-    kspace_echo[:, :img.shape[1], :img.shape[2], :] = img
-
-    kspace_cc_echo = apply_cc_coillast_torch(kspace_echo, Wcc, x_chunk=8)
+    kspace_cc_acquired = apply_cc_coillast_torch(img, Wcc, x_chunk=8)
+    ncc = int(Wcc.shape[1])
+    kspace_cc_echo = torch.zeros((Nx_os, Ny, Nz, ncc), dtype=torch.cfloat)
+    kspace_cc_echo[:, :img.shape[1], :img.shape[2], :] = kspace_cc_acquired
+    del kspace_cc_acquired, img
+    gc.collect()
     kspace_cc_file = (
         out_folder + 'kspace_' + tag_wave + '_cc_' +
         str(res_x) + 'x' + str(res_y) + 'x' + str(res_z) +
         '_Ry' + str(Ry) + '_Rz' + str(Rz) + '_' + file_tag
     )
-    _save_npy(kspace_cc_file, kspace_cc_echo, 'coil-compressed k-space')
-
-    # Use ESPIRiT maps estimated above.
-    ncc = int(csm_full_cc_np.shape[0])
-    _check_csm_shape(csm_full_cc_np, Nx, Ny, Nz)
-    sens = torch.zeros((ncc, Nx_os, Ny, Nz), dtype=torch.complex64)
-    x0 = Nx_os // 2 - csm_full_cc_np.shape[1] // 2
-    x1 = x0 + csm_full_cc_np.shape[1]
-    sens[:, x0:x1] = torch.from_numpy(csm_full_cc_np).contiguous()
-
-    # Sampling mask M. kspace_cc_echo shape: (Nx_os, Ny, Nz, ncc).
-    mask_2d = torch.sum(torch.abs(kspace_cc_echo) ** 2, dim=(0, 3)) > 0
-    mask_2d = mask_2d.cpu().numpy().astype(np.float32)
-    mask_t = torch.from_numpy(mask_2d).view(1, 1, *mask_2d.shape)  # broadcast to (ncoil, Nx_os, Ny, Nz)
+    if reconstruction_backend == "sense":
+        _save_npy(kspace_cc_file, kspace_cc_echo, 'coil-compressed k-space')
 
     if tag_wave == 'wave':
         print("Processing Wave Data...")
-        y_meas = kspace_cc_echo.permute(3, 0, 1, 2)  # (ncoil, Nx_os, Ny, Nz)
 
         print("Generating calibrated PSF from integrated refscan calibration blocks...")
         psf_calib, psf_theory, psf_processing_diagnostics = generate_calibrated_psf(
@@ -262,6 +265,7 @@ def main():
                 os_factor=os_factor,
                 Nacs=nacs,
                 Wcc=Wcc,
+                logical_acs=logical_acs,
             )
             manifest_path = export_wave_inputs(
                 bart_folder,
@@ -304,6 +308,19 @@ def main():
                 )
                 print(f"Saved BART Wave-CAIPI reconstruction under: {bart_output_folder}")
                 return
+
+        if csm_full_cc_np is None:
+            raise RuntimeError("The SENSE backend requires SigPy sensitivity maps.")
+        _check_csm_shape(csm_full_cc_np, Nx, Ny, Nz)
+        sens = torch.zeros((ncc, Nx_os, Ny, Nz), dtype=torch.complex64)
+        x0 = Nx_os // 2 - csm_full_cc_np.shape[1] // 2
+        x1 = x0 + csm_full_cc_np.shape[1]
+        sens[:, x0:x1] = torch.from_numpy(csm_full_cc_np).contiguous()
+        mask_2d = torch.sum(torch.abs(kspace_cc_echo) ** 2, dim=(0, 3)) > 0
+        mask_t = torch.from_numpy(
+            mask_2d.cpu().numpy().astype(np.float32)
+        ).view(1, 1, *mask_2d.shape)
+        y_meas = kspace_cc_echo.permute(3, 0, 1, 2)
 
         psf_to_use = psf_calib.clone()
         # psf_to_use = psf_theory.clone()
@@ -364,6 +381,17 @@ def main():
             )
 
     elif tag_wave == 'nowave':
+        if csm_full_cc_np is None:
+            raise RuntimeError("The SENSE backend requires SigPy sensitivity maps.")
+        _check_csm_shape(csm_full_cc_np, Nx, Ny, Nz)
+        sens = torch.zeros((ncc, Nx_os, Ny, Nz), dtype=torch.complex64)
+        x0 = Nx_os // 2 - csm_full_cc_np.shape[1] // 2
+        x1 = x0 + csm_full_cc_np.shape[1]
+        sens[:, x0:x1] = torch.from_numpy(csm_full_cc_np).contiguous()
+        mask_2d = torch.sum(torch.abs(kspace_cc_echo) ** 2, dim=(0, 3)) > 0
+        mask_t = torch.from_numpy(
+            mask_2d.cpu().numpy().astype(np.float32)
+        ).view(1, 1, *mask_2d.shape)
         # Perform CG SENSE for no wave. Keep the reconstruction operator unchanged.
         def E(x):
             """Forward operator: x (Nx, Ny, Nz) -> k-space coils (nc, Nx, Ny, Nz)."""
@@ -934,6 +962,64 @@ def load_or_generate_coil_sens(
     )
 
 
+def load_or_generate_coil_compression_for_bart(
+    *,
+    mprage_data_file,
+    os_factor,
+    out_folder,
+    file_tag,
+    Nacs=32,
+    reuse_coil_calib=False,
+):
+    """Prepare only Wcc and logical ACS; BART ecalib estimates the maps."""
+
+    data_ref = load_ref(mprage_data_file)
+    _check_integrated_refscan_shape(data_ref, Nacs=Nacs, Ncalib=None)
+    kspace_acs = data_ref[:, :Nacs, :Nacs, -1, :]
+    logical_acs = remove_readout_oversampling_kspace(
+        kspace_acs, os_factor, axis=0
+    ).contiguous()
+    ncoil = int(logical_acs.shape[-1])
+    ncc = 12
+    if ncc > ncoil:
+        raise ValueError(
+            f"Requested ncc={ncc}, but the TWIX refscan has only {ncoil} coils."
+        )
+
+    compression_tag = _coil_compression_cache_tag(file_tag)
+    wcc_file = _npy_output_path(
+        out_folder + "coil_compression_energy_" + compression_tag
+    )
+    if reuse_coil_calib and os.path.isfile(wcc_file):
+        print(f"Loading cached coil compression matrix: {wcc_file}")
+        Wcc = np.load(wcc_file, allow_pickle=False)
+        if Wcc.shape != (ncoil, ncc) or not np.isfinite(Wcc).all():
+            raise ValueError(
+                "Cached coil compression matrix is incompatible with the "
+                f"current ACS: received {Wcc.shape}, expected {(ncoil, ncc)}."
+            )
+    else:
+        if reuse_coil_calib:
+            print("No compatible Wcc cache found; recomputing from logical ACS.")
+        Wcc, _, cc_energy = estimate_cc_matrix_coillast(
+            logical_acs,
+            ncc=ncc,
+            acs=min(int(logical_acs.shape[1]), int(logical_acs.shape[2])),
+            x_step=1,
+        )
+        print(f"Coil-compression matrix: {Wcc.shape}")
+        print(f"Energy retained by {ncc} coils: {float(cc_energy[ncc - 1]):.6f}")
+        _save_npy(
+            out_folder + "coil_compression_energy_" + compression_tag,
+            Wcc,
+            "coil compression matrix",
+        )
+
+    del data_ref, kspace_acs
+    gc.collect()
+    return np.asarray(Wcc), logical_acs, ncoil
+
+
 def generate_coil_sens(
     mprage_data_file,
     Ny,
@@ -1118,15 +1204,19 @@ def _build_bart_calibration_kspace(
     os_factor,
     Nacs,
     Wcc,
+    logical_acs=None,
 ):
     """Return compressed integrated ACS on BART's full logical image grid."""
 
-    data_ref = load_ref(mprage_data_file)
-    _check_integrated_refscan_shape(data_ref, Nacs=Nacs, Ncalib=None)
-    kspace_acs = data_ref[:, :Nacs, :Nacs, -1, :]
-    kspace_acs_logical = remove_readout_oversampling_kspace(
-        kspace_acs, os_factor, axis=0
-    )
+    if logical_acs is None:
+        data_ref = load_ref(mprage_data_file)
+        _check_integrated_refscan_shape(data_ref, Nacs=Nacs, Ncalib=None)
+        kspace_acs = data_ref[:, :Nacs, :Nacs, -1, :]
+        kspace_acs_logical = remove_readout_oversampling_kspace(
+            kspace_acs, os_factor, axis=0
+        )
+    else:
+        kspace_acs_logical = logical_acs
     kspace_acs_cc = apply_cc_coillast_torch(kspace_acs_logical, Wcc, x_chunk=8)
     ncc = int(Wcc.shape[1])
     expected = (Nx, Nacs, Nacs, ncc)
@@ -1979,12 +2069,12 @@ def _parse_cli_args():
         help="Suffix tag used in output filenames.",
     )
     parser.add_argument("--reuse-coil-calib", action="store_true",
-                        help="Reuse the existing coil-compression matrix and the CSM cache for the selected ESPIRiT calibration mode when both are present.")
+                        help="Reuse the coil-compression matrix; the explicit SENSE backend also reuses its compatible CSM cache.")
     parser.add_argument(
         "--espirit-device",
         choices=("auto", "cpu", "gpu"),
         default=None,
-        help="ESPIRiT device: auto uses GPU when available and otherwise CPU. Default: auto.",
+        help="SigPy ESPIRiT device used only by the explicit SENSE backend.",
     )
     parser.add_argument(
         "--espirit-gpu-index",
@@ -2212,7 +2302,7 @@ def _run_bart_reconstruction(
     yflip,
     zflip,
 ):
-    """Run the repository BART wrapper with its wavelet/FISTA defaults."""
+    """Run the repository BART wrapper with its GPU wavelet/FISTA defaults."""
 
     wrapper = Path(__file__).resolve().parent / "bart" / "run_wave_recon.sh"
     command = [
@@ -2262,7 +2352,7 @@ def _run_bart_reconstruction(
             command.append("--twix-use-fov-for-voxel-size")
         command.append("--end-nifti-options")
 
-    print("Running BART Wave-CAIPI reconstruction with default wavelet/FISTA...")
+    print("Running BART Wave-CAIPI reconstruction with default GPU wavelet/FISTA...")
     subprocess.run(command, check=True)
 
 
@@ -2468,21 +2558,22 @@ def _collect_runtime_config():
     print(f"  backend:           {reconstruction_backend_value}")
     print(f"  reuse_coil_calib:  {reuse_coil_calib_value}")
     print("  coil compression: CPU")
-    print(f"  ESPIRiT request:  {espirit_device_value} (GPU index {espirit_gpu_index_value})")
-    print(f"  ESPIRiT mode:     {espirit_calib_mode_value}")
-    print(f"  ESPIRiT crop:     {espirit_crop_value:g}")
-    if espirit_calib_mode_value == "slice2d":
-        print(
-            "  ESPIRiT workers:  "
-            + ("auto" if espirit_cpu_workers_value is None else str(espirit_cpu_workers_value))
-        )
-        print("  SAG RO support:   auto whole-plane guard, S-I, padding=3")
-    else:
-        print("  ESPIRiT workers:  n/a (native 3D backend)")
     if reconstruction_backend_value == "sense":
+        print(f"  ESPIRiT request:  {espirit_device_value} (GPU index {espirit_gpu_index_value})")
+        print(f"  ESPIRiT mode:     {espirit_calib_mode_value}")
+        print(f"  ESPIRiT crop:     {espirit_crop_value:g}")
+        if espirit_calib_mode_value == "slice2d":
+            print(
+                "  ESPIRiT workers:  "
+                + ("auto" if espirit_cpu_workers_value is None else str(espirit_cpu_workers_value))
+            )
+            print("  SAG RO support:   auto whole-plane guard, S-I, padding=3")
+        else:
+            print("  ESPIRiT workers:  n/a (native 3D backend)")
         print("  CG-SENSE:         CPU (explicit legacy backend)")
     else:
-        print("  BART solver:      wavelet/FISTA (-w -f)")
+        print("  sensitivity maps: BART ecalib (SigPy ESPIRiT skipped)")
+        print("  BART solver:      GPU wavelet/FISTA (-w -f -g)")
     print(f"  yflip/zflip:       {yflip_value}/{zflip_value}")
     print(f"  save_nifti:        {save_nifti_value}")
     print(f"  save_bart_inputs:  {save_bart_inputs_value}")

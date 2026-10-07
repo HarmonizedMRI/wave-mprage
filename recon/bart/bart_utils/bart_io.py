@@ -85,7 +85,7 @@ def export_wave_inputs(
     *,
     wave_kspace: np.ndarray,
     calibrated_psf: np.ndarray,
-    coil_sens: np.ndarray,
+    coil_sens: np.ndarray | None,
     kspace_calib: np.ndarray,
     psf_calibration: Mapping[str, Any] | None = None,
     coil_calibration: Mapping[str, Any] | None = None,
@@ -96,7 +96,8 @@ def export_wave_inputs(
         out_folder: Destination directory for BART CFL pairs and manifest.
         wave_kspace: Wave k-space in ``(wx, sy, sz, echo, coil)`` order.
         calibrated_psf: Calibrated PSF in ``(echo, wx, sy, sz)`` order.
-        coil_sens: Coil maps in ``(coil, sx, sy, sz)`` order.
+        coil_sens: Optional coil maps in ``(coil, sx, sy, sz)`` order. The
+            default BART-ecalib path omits these maps.
         kspace_calib: Calibration k-space in ``(sx, sy, sz, coil)`` order.
         psf_calibration: Optional JSON-compatible PSF processing provenance.
         coil_calibration: Optional JSON-compatible coil-calibration provenance.
@@ -109,7 +110,6 @@ def export_wave_inputs(
     destination.mkdir(parents=True, exist_ok=True)
     kspace = _complex64("wave_kspace", wave_kspace, 5)
     psf = _complex64("calibrated_psf", calibrated_psf, 4)
-    maps = _complex64("coil_sens", coil_sens, 4)
     calib = _complex64("kspace_calib", kspace_calib, 4)
 
     wx, sy, sz, necho, nc = map(int, kspace.shape)
@@ -118,14 +118,19 @@ def export_wave_inputs(
             "calibrated_psf shape must be (echo, wx, sy, sz); "
             f"expected {(necho, wx, sy, sz)}, received {psf.shape}."
         )
-    sx = int(maps.shape[1])
-    if maps.shape != (nc, sx, sy, sz):
-        raise ValueError(f"coil_sens must have shape {(nc, sx, sy, sz)}; got {maps.shape}.")
+    sx = int(calib.shape[0])
     if calib.shape != (sx, sy, sz, nc):
         raise ValueError(f"kspace_calib must have shape {(sx, sy, sz, nc)}; got {calib.shape}.")
 
-    exported_maps = np.moveaxis(maps, 0, 3)[..., None]
-    write_cfl(destination / "coil_sens", exported_maps)
+    exported_maps = None
+    if coil_sens is not None:
+        maps = _complex64("coil_sens", coil_sens, 4)
+        if maps.shape != (nc, sx, sy, sz):
+            raise ValueError(
+                f"coil_sens must have shape {(nc, sx, sy, sz)}; got {maps.shape}."
+            )
+        exported_maps = np.moveaxis(maps, 0, 3)[..., None]
+        write_cfl(destination / "coil_sens", exported_maps)
     write_cfl(destination / "kspace_calib", calib)
     files: list[dict[str, Any]] = []
     for echo_index in range(necho):
@@ -150,12 +155,13 @@ def export_wave_inputs(
     manifest = {
         "format": "BART CFL",
         "dimension_order": ["READ", "PHS1", "PHS2", "COIL", "MAPS"],
-        "coil_sens": "coil_sens",
-        "coil_sens_shape": list(exported_maps.shape),
         "kspace_calib": "kspace_calib",
         "kspace_calib_shape": list(calib.shape),
         "echoes": files,
     }
+    if exported_maps is not None:
+        manifest["coil_sens"] = "coil_sens"
+        manifest["coil_sens_shape"] = list(exported_maps.shape)
     if psf_calibration is not None:
         manifest["psf_calibration"] = dict(psf_calibration)
     if coil_calibration is not None:
