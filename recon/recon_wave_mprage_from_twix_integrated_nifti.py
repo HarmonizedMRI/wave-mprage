@@ -85,11 +85,18 @@ READOUT_OVERSAMPLING_REMOVAL = {
     "fft_normalization": "ortho",
 }
 
-# The fitted projection planes and the imaging trajectory already share the
-# matched-MPRAGE LIN/PAR array convention after applying yflip and zflip.  No
-# additional PE-coordinate reversal belongs in PSF composition.
-CALIBRATION_TO_IMAGING_PE_COORDINATE_SIGN = (1, 1)
-PSF_COMPOSITION_VERSION = 3
+# TWIX MDH counters increase with the physical refscan gradients but decrease
+# with the physical MPRAGE gradients on both phase-encode axes. Align the
+# centered refscan ACS to MPRAGE indices before sensitivity-map estimation,
+# and express projection-calibration phase slopes on that same imaging grid.
+CALIBRATION_TO_IMAGING_PE_COORDINATE_SIGN = (-1, -1)
+PSF_COMPOSITION_VERSION = 4
+REFSCAN_TO_IMAGING_PE_INDEX_TRANSFORM = {
+    "version": 1,
+    "method": "centered-reverse",
+    "axes": ["LIN", "PAR"],
+    "roll_after_flip": 1,
+}
 
 
 def _current_psf_composition_provenance():
@@ -192,6 +199,11 @@ def main():
         source_twix=mprage_data_file,
         source_seq=mprage_seq_file,
         expected_psf_composition=_current_psf_composition_provenance(),
+        expected_coil_calibration={
+            "refscan_to_imaging_pe_index_transform": (
+                REFSCAN_TO_IMAGING_PE_INDEX_TRANSFORM
+            )
+        },
     ):
         print("Resume: current BART reconstruction is complete; skipping TWIX preprocessing.")
         _run_bart_reconstruction(
@@ -331,6 +343,9 @@ def main():
                 psf_calibration=psf_processing_diagnostics,
                 coil_calibration={
                     **READOUT_OVERSAMPLING_REMOVAL,
+                    "refscan_to_imaging_pe_index_transform": (
+                        REFSCAN_TO_IMAGING_PE_INDEX_TRANSFORM
+                    ),
                     "source_twix": str(Path(mprage_data_file).resolve()),
                     "source_seq": str(Path(mprage_seq_file).resolve()),
                     "oversampling_factor": int(os_factor),
@@ -897,6 +912,34 @@ def _sanitize_filename_component(value):
 # Integrated refscan ACS / coil-sensitivity handling
 # -----------------------------------------------------------------------------
 
+def _align_refscan_acs_to_imaging_grid(logical_acs):
+    """Map centered refscan LIN/PAR samples onto MPRAGE index ordering.
+
+    Args:
+        logical_acs: Tensor with logical readout, LIN, and PAR as its first
+            three dimensions. Additional dimensions, such as coil, are kept.
+
+    Returns:
+        A tensor with centered reversals applied to LIN and PAR. Readout and
+        all trailing dimensions are unchanged.
+
+    Raises:
+        ValueError: If the input does not contain non-empty RO/LIN/PAR axes.
+    """
+
+    aligned = torch.as_tensor(logical_acs)
+    if aligned.ndim < 3 or any(int(aligned.shape[axis]) < 1 for axis in range(3)):
+        raise ValueError(
+            "logical_acs must have non-empty RO/LIN/PAR dimensions; "
+            f"received {tuple(aligned.shape)}."
+        )
+    return torch.roll(
+        torch.flip(aligned, dims=(1, 2)),
+        shifts=(1, 1),
+        dims=(1, 2),
+    ).contiguous()
+
+
 def _cuda_device_count():
     """Return visible CUDA device count and an optional diagnostic message."""
     if cp is None:
@@ -1231,7 +1274,20 @@ def generate_coil_sens(
         where=rss > 1e-8,
     )
 
-    # Version cache names so pre-fix stride-derived calibrations cannot be reused.
+    # ESPIRiT maps inherit the refscan image coordinates. Reverse their final
+    # full-grid LIN/PAR axes so they match the MPRAGE k-space index ordering.
+    csm_full_cc_np = np.roll(
+        np.flip(csm_full_cc_np, axis=(2, 3)),
+        shift=(1, 1),
+        axis=(2, 3),
+    ).copy()
+    csm_low_cc_np = np.roll(
+        np.flip(csm_low_cc_np, axis=(2, 3)),
+        shift=(1, 1),
+        axis=(2, 3),
+    ).copy()
+
+    # Version CSM caches so pre-fix RO processing and PE ordering are not reused.
     compression_tag = _coil_compression_cache_tag(file_tag)
     _save_npy(out_folder + 'coil_compression_energy_' + compression_tag, Wcc, 'coil compression matrix')
     _save_npy(out_folder + 'csm_acs_' + csm_tag, csm_low_cc_np, 'low-resolution ESPIRiT CSM')
@@ -1287,7 +1343,7 @@ def _build_bart_calibration_kspace(
     y0 = (Ny - Nacs) // 2
     z0 = (Nz - Nacs) // 2
     full[:, y0 : y0 + Nacs, z0 : z0 + Nacs, :] = kspace_acs_cc
-    return full.numpy()
+    return _align_refscan_acs_to_imaging_grid(full).numpy()
 
 
 # -----------------------------------------------------------------------------
@@ -2422,15 +2478,15 @@ def _npy_output_path(path_without_ext):
 
 
 def _espirit_cache_tag(file_tag, mode):
-    """Return a mode- and RO-processing-specific CSM cache tag."""
+    """Return a mode-, RO-, and PE-ordering-specific CSM cache tag."""
     mode = str(mode).strip().lower()
     file_tag = str(file_tag)
     if mode == "3d":
-        prefix = "roimgcrop"
+        prefix = "pealign_roimgcrop"
         return prefix if file_tag == "" else prefix + "_" + file_tag
     if mode == "slice2d":
-        # Both the SAG support guard and RO image crop affect the CSM identity.
-        prefix = "slice2d_sagmask_roimgcrop"
+        # The SAG support guard, RO crop, and PE alignment affect CSM identity.
+        prefix = "slice2d_sagmask_pealign_roimgcrop"
         return prefix if file_tag == "" else prefix + "_" + file_tag
     raise ValueError("ESPIRiT calibration mode must be '3d' or 'slice2d'.")
 

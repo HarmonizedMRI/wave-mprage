@@ -16,10 +16,18 @@ from recon.bart.bart_utils.bart_io import (
 
 
 CURRENT_PSF_COMPOSITION = {
-    "version": 3,
-    "calibration_to_imaging_pe_coordinate_sign": {"LIN": 1, "PAR": 1},
+    "version": 4,
+    "calibration_to_imaging_pe_coordinate_sign": {"LIN": -1, "PAR": -1},
     "constant_phase_sign": 1,
     "bart_forward_application": "direct",
+}
+CURRENT_COIL_CALIBRATION = {
+    "refscan_to_imaging_pe_index_transform": {
+        "version": 1,
+        "method": "centered-reverse",
+        "axes": ["LIN", "PAR"],
+        "roll_after_flip": 1,
+    }
 }
 
 
@@ -54,6 +62,7 @@ class BartIoTests(unittest.TestCase):
                     source_twix=twix,
                     source_seq=sequence,
                     expected_psf_composition=CURRENT_PSF_COMPOSITION,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
                 )
             )
             provenance = json.loads(manifest_path.read_text(encoding="utf-8"))[
@@ -64,6 +73,12 @@ class BartIoTests(unittest.TestCase):
             self.assertEqual(
                 provenance["source_provenance"],
                 "inferred-from-complete-current-legacy-outputs",
+            )
+            self.assertEqual(
+                provenance["refscan_to_imaging_pe_index_transform"],
+                CURRENT_COIL_CALIBRATION[
+                    "refscan_to_imaging_pe_index_transform"
+                ],
             )
 
     def test_complete_reconstruction_is_current_and_truncation_invalidates_it(self) -> None:
@@ -82,6 +97,7 @@ class BartIoTests(unittest.TestCase):
                 coil_sens=None,
                 kspace_calib=np.ones((4, 3, 2, 2), np.complex64),
                 coil_calibration={
+                    **CURRENT_COIL_CALIBRATION,
                     "source_twix": str(twix.resolve()),
                     "source_seq": str(sequence.resolve()),
                 },
@@ -99,6 +115,7 @@ class BartIoTests(unittest.TestCase):
                     source_twix=twix,
                     source_seq=sequence,
                     expected_psf_composition=CURRENT_PSF_COMPOSITION,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
                 )
             )
             wrong_twix = root / "wrong.dat"
@@ -110,6 +127,7 @@ class BartIoTests(unittest.TestCase):
                     source_twix=wrong_twix,
                     source_seq=sequence,
                     expected_psf_composition=CURRENT_PSF_COMPOSITION,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
                 )
             )
             image.with_suffix(".cfl").write_bytes(b"\x00" * 8)
@@ -120,6 +138,7 @@ class BartIoTests(unittest.TestCase):
                     source_twix=twix,
                     source_seq=sequence,
                     expected_psf_composition=CURRENT_PSF_COMPOSITION,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
                 )
             )
 
@@ -142,14 +161,55 @@ class BartIoTests(unittest.TestCase):
                 kspace_calib=np.ones((4, 3, 2, 2), np.complex64),
                 psf_calibration={
                     "psf_composition": {
-                        "version": 2,
+                        "version": 3,
                         "calibration_to_imaging_pe_coordinate_sign": {
-                            "LIN": -1,
-                            "PAR": -1,
+                            "LIN": 1,
+                            "PAR": 1,
                         },
                         "constant_phase_sign": 1,
                     }
                 },
+                coil_calibration={
+                    **CURRENT_COIL_CALIBRATION,
+                    "source_twix": str(twix.resolve()),
+                    "source_seq": str(sequence.resolve()),
+                },
+            )
+            write_cfl(
+                outputs / "coil_sens_bart",
+                np.ones((4, 3, 2, 2), np.complex64),
+            )
+            write_cfl(outputs / "image_wave", np.ones((4, 3, 2), np.complex64))
+
+            self.assertFalse(
+                bart_reconstruction_is_current(
+                    inputs,
+                    outputs,
+                    source_twix=twix,
+                    source_seq=sequence,
+                    expected_psf_composition=CURRENT_PSF_COMPOSITION,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
+                )
+            )
+
+    def test_recorded_incompatible_coil_ordering_invalidates_resume(self) -> None:
+        """Modern outputs with stale refscan PE ordering must not be reused."""
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            inputs = root / "inputs"
+            outputs = root / "outputs"
+            twix = root / "input.dat"
+            sequence = root / "input.seq"
+            twix.touch()
+            sequence.touch()
+            export_wave_inputs(
+                inputs,
+                wave_kspace=np.ones((8, 3, 2, 1, 2), np.complex64),
+                calibrated_psf=np.ones((1, 8, 3, 2), np.complex64),
+                coil_sens=None,
+                kspace_calib=np.ones((4, 3, 2, 2), np.complex64),
+                psf_calibration={"psf_composition": CURRENT_PSF_COMPOSITION},
                 coil_calibration={
                     "source_twix": str(twix.resolve()),
                     "source_seq": str(sequence.resolve()),
@@ -168,6 +228,7 @@ class BartIoTests(unittest.TestCase):
                     source_twix=twix,
                     source_seq=sequence,
                     expected_psf_composition=CURRENT_PSF_COMPOSITION,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
                 )
             )
 

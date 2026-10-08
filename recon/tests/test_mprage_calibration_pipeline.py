@@ -115,17 +115,22 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
             )
 
         expected_acs = _centered_fft(logical_image)[..., :2]
+        expected_full = np.zeros((4, 4, 4, 2), dtype=np.complex64)
+        expected_full[:, 1:3, 1:3, :] = expected_acs
+        expected_full = np.roll(
+            np.flip(expected_full, axis=(1, 2)),
+            shift=(1, 1),
+            axis=(1, 2),
+        )
         self.assertEqual(actual.shape, (4, 4, 4, 2))
         np.testing.assert_allclose(
-            actual[:, 1:3, 1:3, :],
-            expected_acs,
+            actual,
+            expected_full,
             rtol=2e-6,
             atol=2e-6,
         )
-        self.assertEqual(np.count_nonzero(actual[:, :1]), 0)
-        self.assertEqual(np.count_nonzero(actual[:, 3:]), 0)
-        self.assertEqual(np.count_nonzero(actual[:, :, :1]), 0)
-        self.assertEqual(np.count_nonzero(actual[:, :, 3:]), 0)
+        self.assertEqual(np.count_nonzero(actual), np.count_nonzero(expected_full))
+        self.assertGreater(np.count_nonzero(actual[:, 3]), 0)
 
     def test_cache_tags_reject_stride_derived_calibration(self) -> None:
         """Corrected PCA and CSM caches should have distinct identities."""
@@ -136,15 +141,26 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
         )
         self.assertEqual(
             reconstruction._espirit_cache_tag("case", "3d"),
-            "roimgcrop_case",
+            "pealign_roimgcrop_case",
         )
         self.assertEqual(
             reconstruction._espirit_cache_tag("case", "slice2d"),
-            "slice2d_sagmask_roimgcrop_case",
+            "slice2d_sagmask_pealign_roimgcrop_case",
         )
 
-    def test_psf_composition_uses_matched_imaging_pe_polarity(self) -> None:
-        """Theory and fitted slopes should use the BART imaging PE grid directly."""
+    def test_refscan_alignment_is_centered_lin_par_reversal(self) -> None:
+        """Refscan alignment should reverse PE axes without shifting k-space zero."""
+
+        source = torch.arange(2 * 4 * 6 * 2).reshape(2, 4, 6, 2)
+        actual = reconstruction._align_refscan_acs_to_imaging_grid(source)
+
+        expected = source[:, torch.tensor([0, 3, 2, 1])]
+        expected = expected[:, :, torch.tensor([0, 5, 4, 3, 2, 1])]
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual[:, 0, 0], source[:, 0, 0])
+
+    def test_psf_composition_maps_refscan_slopes_to_imaging_polarity(self) -> None:
+        """Theory and fitted slopes should reverse with the refscan PE coordinates."""
 
         delta_ky = np.array([0.35, -0.2])
         delta_kz = np.array([-0.15, 0.4])
@@ -168,7 +184,7 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
 
         image_y, image_z = np.meshgrid(y_norm, z_norm, indexing="ij")
         expected_theory = np.exp(
-            -1j
+            1j
             * 2.0
             * np.pi
             * (
@@ -177,8 +193,8 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
             )
         )
         expected_deviation = (
-            a_fit[:, None, None] * image_y[None, ...]
-            + b_fit[:, None, None] * image_z[None, ...]
+            -a_fit[:, None, None] * image_y[None, ...]
+            - b_fit[:, None, None] * image_z[None, ...]
             + c_fit[:, None, None]
         )
 
@@ -191,10 +207,10 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
         self.assertEqual(
             reconstruction._current_psf_composition_provenance(),
             {
-                "version": 3,
+                "version": 4,
                 "calibration_to_imaging_pe_coordinate_sign": {
-                    "LIN": 1,
-                    "PAR": 1,
+                    "LIN": -1,
+                    "PAR": -1,
                 },
                 "constant_phase_sign": 1,
                 "bart_forward_application": "direct",

@@ -111,12 +111,13 @@ def bart_reconstruction_is_current(
     source_twix: str | Path,
     source_seq: str | Path,
     expected_psf_composition: Mapping[str, Any] | None = None,
+    expected_coil_calibration: Mapping[str, Any] | None = None,
 ) -> bool:
     """Return true when BART maps and every manifest echo are complete/current.
 
-    A recorded PSF-composition identity must match the requested identity.
-    Manifests created before PSF-composition provenance was introduced remain
-    eligible for the full source, timestamp, and CFL-integrity validation.
+    Recorded PSF-composition and coil-calibration identities must match their
+    requested identities. Legacy manifests remain eligible for full source,
+    timestamp, and CFL-integrity validation and are upgraded after acceptance.
     """
 
     input_path = Path(input_dir)
@@ -137,6 +138,11 @@ def bart_reconstruction_is_current(
         legacy_provenance = recorded_twix is None and recorded_seq is None
         if not legacy_provenance:
             if recorded_twix != str(twix_path) or recorded_seq != str(seq_path):
+                return False
+            if expected_coil_calibration is not None and any(
+                provenance.get(key) != value
+                for key, value in expected_coil_calibration.items()
+            ):
                 return False
         if expected_psf_composition is not None:
             psf_calibration = manifest.get("psf_calibration")
@@ -197,6 +203,8 @@ def bart_reconstruction_is_current(
                 "source_provenance": "inferred-from-complete-current-legacy-outputs",
             }
         )
+        if expected_coil_calibration is not None:
+            upgraded_provenance.update(dict(expected_coil_calibration))
         manifest["coil_calibration"] = upgraded_provenance
         try:
             manifest_path.write_text(
