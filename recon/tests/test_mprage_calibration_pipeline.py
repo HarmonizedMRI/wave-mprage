@@ -52,6 +52,13 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
         with mock.patch.object(sys, "argv", base + ["--no-save-nifti"]):
             self.assertFalse(reconstruction._parse_cli_args().save_nifti)
 
+    def test_resume_is_enabled_by_default_and_accepts_explicit_override(self) -> None:
+        base = ["recon", "--twix", "input.dat", "--seq", "input.seq", "--out", "out"]
+        with mock.patch.object(sys, "argv", base + ["--resume"]):
+            self.assertTrue(reconstruction._parse_cli_args().resume)
+        with mock.patch.object(sys, "argv", base + ["--no-resume"]):
+            self.assertFalse(reconstruction._parse_cli_args().resume)
+
     def test_integrated_bart_runner_uses_wrapper_defaults_and_skips_nifti(self) -> None:
         """The default backend should invoke BART without running local CG-SENSE."""
 

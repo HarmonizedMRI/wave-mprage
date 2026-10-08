@@ -117,6 +117,7 @@ def main():
     psf_fit_kx_max = cfg["psf_fit_kx_max"]
     save_bart_inputs = cfg["save_bart_inputs"]
     reconstruction_backend = cfg["reconstruction_backend"]
+    resume = cfg["resume"]
 
     seq = pp.Sequence()
     seq.read(mprage_seq_file, remove_duplicates=False)
@@ -165,7 +166,7 @@ def main():
     bart_output_folder = Path(out_folder) / (
         "bart_output" + (f"_{bart_tag}" if bart_tag else "")
     )
-    if reconstruction_backend == "bart" and bart_reconstruction_is_current(
+    if resume and reconstruction_backend == "bart" and bart_reconstruction_is_current(
         bart_folder,
         bart_output_folder,
         source_twix=mprage_data_file,
@@ -190,6 +191,7 @@ def main():
             file_tag=file_tag,
             yflip=yflip,
             zflip=zflip,
+            resume=resume,
         )
         print("Resume completed without rerunning BART reconstruction.")
         return
@@ -336,6 +338,7 @@ def main():
                     file_tag=file_tag,
                     yflip=yflip,
                     zflip=zflip,
+                    resume=resume,
                 )
                 print(f"Saved BART Wave-CAIPI reconstruction under: {bart_output_folder}")
                 return
@@ -2093,6 +2096,20 @@ def _parse_cli_args():
             "CG-SENSE solver."
         ),
     )
+    resume_group = parser.add_mutually_exclusive_group()
+    resume_group.add_argument(
+        "--resume",
+        dest="resume",
+        action="store_true",
+        help="Reuse a complete, current BART reconstruction (default).",
+    )
+    resume_group.add_argument(
+        "--no-resume",
+        dest="resume",
+        action="store_false",
+        help="Force TWIX preprocessing and BART reconstruction to run again.",
+    )
+    parser.set_defaults(resume=True)
 
     parser.add_argument(
         "--file-tag",
@@ -2344,6 +2361,7 @@ def _run_bart_reconstruction(
     file_tag,
     yflip,
     zflip,
+    resume=True,
 ):
     """Run the repository BART wrapper with its GPU wavelet/FISTA defaults."""
 
@@ -2361,8 +2379,9 @@ def _run_bart_reconstruction(
         str(twix_file),
         "--seq",
         str(seq_file),
-        "--resume",
     ]
+    if resume:
+        command.append("--resume")
     if not save_nifti:
         command.append("--skip-nifti")
     else:
@@ -2455,6 +2474,7 @@ def _collect_runtime_config():
         slice_orientation=mode_orientation,
     )
     reconstruction_backend_value = str(cli.reconstruction_backend).strip().lower()
+    resume_value = bool(cli.resume)
     save_bart_inputs_value = bool(
         reconstruction_backend_value == "bart"
         or cli.save_bart_inputs
@@ -2596,6 +2616,7 @@ def _collect_runtime_config():
     print(f"  file_tag:          {file_tag_value}")
     print(f"  reconstruction:    {tag_wave_value}")
     print(f"  backend:           {reconstruction_backend_value}")
+    print(f"  resume:            {resume_value}")
     print(f"  reuse_coil_calib:  {reuse_coil_calib_value}")
     print("  coil compression: CPU")
     if reconstruction_backend_value == "sense":
@@ -2634,6 +2655,7 @@ def _collect_runtime_config():
         "file_tag": file_tag_value,
         "tag_wave": tag_wave_value,
         "reconstruction_backend": reconstruction_backend_value,
+        "resume": resume_value,
         "reuse_coil_calib": reuse_coil_calib_value,
         "espirit_device": espirit_device_value,
         "espirit_gpu_index": espirit_gpu_index_value,
