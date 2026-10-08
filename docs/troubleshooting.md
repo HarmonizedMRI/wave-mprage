@@ -450,7 +450,12 @@ The guard uses one RMS score per complete LIN-PAR plane. This is intentionally s
 
 ## ESPIRiT crop removes low-SNR anatomy
 
-`--espirit-crop` remains active in both `3d` and `slice2d` modes. Higher values create a stricter support mask; lower values retain broader support. In slice2d mode the threshold is applied independently to each logical-RO plane.
+`--espirit-crop` configures BART `ecalib` for the default BART backend and
+SigPy for the explicit SENSE backend. Higher values create a stricter support
+mask; lower values retain broader support. In SENSE `slice2d` mode the
+threshold is applied independently to each logical-RO plane. Pass this option
+directly to the integrated Python command; `--ecalib-options` is only accepted
+by the lower-level shell wrapper.
 
 Testing with the current Wave-MPRAGE implementation found `0.8–0.9` to be a reasonable practical range:
 
@@ -458,7 +463,12 @@ Testing with the current Wave-MPRAGE implementation found `0.8–0.9` to be a re
 - use `0.9` when the broader support from `0.8` includes too much unreliable background;
 - inspect both CSM magnitude and phase plots and the final reconstruction.
 
-Recompute the maps after changing crop. Do not use `--reuse-coil-calib` for that comparison, because a cached CSM has already had its crop mask applied. If important anatomy remains absent at `0.8`, the limitation may come from the calibration subspace or local SNR rather than crop alone.
+Recompute the maps after changing crop. BART crop provenance is resume-checked,
+so a changed value invalidates recorded BART maps. For the SENSE backend, do
+not use `--reuse-coil-calib` for that comparison because a cached CSM has
+already had its crop mask applied. If important anatomy remains absent at
+`0.8`, the limitation may come from the calibration subspace or local SNR
+rather than crop alone.
 
 ## CUDA, CuPy, and driver mismatch
 

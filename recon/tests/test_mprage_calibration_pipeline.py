@@ -59,6 +59,22 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
         with mock.patch.object(sys, "argv", base + ["--no-resume"]):
             self.assertFalse(reconstruction._parse_cli_args().resume)
 
+    def test_espirit_crop_is_accepted_by_the_integrated_cli(self) -> None:
+        """The top-level crop option should configure either reconstruction backend."""
+        argv = [
+            "recon",
+            "--twix",
+            "input.dat",
+            "--seq",
+            "input.seq",
+            "--out",
+            "out",
+            "--espirit-crop",
+            "0.5",
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            self.assertEqual(reconstruction._parse_cli_args().espirit_crop, 0.5)
+
     def test_integrated_bart_runner_uses_wrapper_defaults_and_skips_nifti(self) -> None:
         """The default backend should invoke BART without running local CG-SENSE."""
 
@@ -81,11 +97,17 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
                 file_tag="",
                 yflip=-1,
                 zflip=-1,
+                espirit_crop=0.5,
             )
 
         command = run.call_args.args[0]
         self.assertIn("--skip-nifti", command)
         self.assertNotIn("--wave-options", command)
+        ecalib_start = command.index("--ecalib-options")
+        self.assertEqual(
+            command[ecalib_start : ecalib_start + 4],
+            ["--ecalib-options", "-c", "0.5", "--end-ecalib-options"],
+        )
         run.assert_called_once_with(command, check=True)
 
     def test_bart_calibration_uses_alias_free_logical_acs(self) -> None:

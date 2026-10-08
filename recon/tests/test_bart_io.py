@@ -27,7 +27,8 @@ CURRENT_COIL_CALIBRATION = {
         "method": "centered-reverse",
         "axes": ["LIN", "PAR"],
         "roll_after_flip": 1,
-    }
+    },
+    "bart_ecalib": {"maps": 1, "crop": 0.8},
 }
 
 
@@ -55,6 +56,20 @@ class BartIoTests(unittest.TestCase):
             write_cfl(outputs / "coil_sens_bart", np.ones((4, 3, 2, 2), np.complex64))
             write_cfl(outputs / "image_wave", np.ones((4, 3, 2), np.complex64))
 
+            self.assertFalse(
+                bart_reconstruction_is_current(
+                    inputs,
+                    outputs,
+                    source_twix=twix,
+                    source_seq=sequence,
+                    expected_psf_composition=CURRENT_PSF_COMPOSITION,
+                    expected_coil_calibration={
+                        **CURRENT_COIL_CALIBRATION,
+                        "bart_ecalib": {"maps": 1, "crop": 0.5},
+                    },
+                    allow_legacy_provenance=False,
+                )
+            )
             self.assertTrue(
                 bart_reconstruction_is_current(
                     inputs,
@@ -116,6 +131,19 @@ class BartIoTests(unittest.TestCase):
                     source_seq=sequence,
                     expected_psf_composition=CURRENT_PSF_COMPOSITION,
                     expected_coil_calibration=CURRENT_COIL_CALIBRATION,
+                )
+            )
+            self.assertFalse(
+                bart_reconstruction_is_current(
+                    inputs,
+                    outputs,
+                    source_twix=twix,
+                    source_seq=sequence,
+                    expected_psf_composition=CURRENT_PSF_COMPOSITION,
+                    expected_coil_calibration={
+                        **CURRENT_COIL_CALIBRATION,
+                        "bart_ecalib": {"maps": 1, "crop": 0.5},
+                    },
                 )
             )
             wrong_twix = root / "wrong.dat"

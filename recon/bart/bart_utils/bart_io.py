@@ -112,12 +112,31 @@ def bart_reconstruction_is_current(
     source_seq: str | Path,
     expected_psf_composition: Mapping[str, Any] | None = None,
     expected_coil_calibration: Mapping[str, Any] | None = None,
+    allow_legacy_provenance: bool = True,
 ) -> bool:
     """Return true when BART maps and every manifest echo are complete/current.
 
     Recorded PSF-composition and coil-calibration identities must match their
     requested identities. Legacy manifests remain eligible for full source,
     timestamp, and CFL-integrity validation and are upgraded after acceptance.
+
+    Args:
+        input_dir: Directory containing the BART input manifest and CFL pairs.
+        output_dir: Directory containing BART maps and reconstructed images.
+        source_twix: TWIX source that must match recorded provenance.
+        source_seq: Pulseq source that must match recorded provenance.
+        expected_psf_composition: Optional required PSF identity fields.
+        expected_coil_calibration: Optional required coil-calibration fields.
+        allow_legacy_provenance: Permit complete manifests without recorded
+            source paths. Disable this when a non-default setting cannot be
+            safely inferred for legacy outputs.
+
+    Returns:
+        True only when provenance, timestamps, dimensions, and CFL byte counts
+        show that every required output is reusable.
+
+    Side Effects:
+        Accepted legacy manifests are upgraded in place when writable.
     """
 
     input_path = Path(input_dir)
@@ -136,6 +155,8 @@ def bart_reconstruction_is_current(
         recorded_twix = provenance.get("source_twix")
         recorded_seq = provenance.get("source_seq")
         legacy_provenance = recorded_twix is None and recorded_seq is None
+        if legacy_provenance and not allow_legacy_provenance:
+            return False
         if not legacy_provenance:
             if recorded_twix != str(twix_path) or recorded_seq != str(seq_path):
                 return False

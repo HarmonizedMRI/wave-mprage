@@ -68,8 +68,10 @@ The current execution model is:
 | Explicit legacy Wave/no-wave CG-SENSE | CPU |
 
 The default BART backend requires a BART build with GPU support because it
-invokes `bart wave -w -f -g`. SigPy ESPIRiT options apply only when
-`--reconstruction-backend sense` is selected.
+invokes `bart wave -w -f -g`. SigPy-specific ESPIRiT device, mode, and worker
+options apply only when `--reconstruction-backend sense` is selected;
+`--espirit-crop` configures either BART `ecalib` or SigPy, according to the
+selected reconstruction backend.
 
 ## Clone
 
@@ -221,6 +223,19 @@ explicitly; use `--no-resume` to force reconstruction. Complete legacy BART
 outputs without source-path provenance are validated and upgraded in place on
 their first resumed run.
 
+For lightweight sensitivity-support inspection without TWIX or sequence
+metadata, convert BART maps in their unchanged logical axis order:
+
+```bash
+python recon/bart/csm_to_nifti_local.py \
+  --csm /path/to/coil_sens_bart \
+  --out /path/to/coil_sens_bart_rss.nii.gz \
+  --voxel-size 0.64 0.64 0.64
+```
+
+This diagnostic NIfTI uses a synthetic affine and must not be interpreted as
+having correct anatomical orientation.
+
 Force CPU ESPIRiT while explicitly requiring wave reconstruction:
 
 ```bash
@@ -258,7 +273,14 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
   --espirit-crop 0.8
 ```
 
-`--espirit-crop` is valid for both calibration modes. Testing with the current Wave-MPRAGE implementation found `0.8–0.9` to be a reasonable practical range: `0.8` retains somewhat broader low-SNR support, while `0.9` applies a stricter support mask. Inspect the saved CSM magnitude and phase plots for each acquisition.
+`--espirit-crop` is valid for both reconstruction backends. The integrated
+Python command passes it to BART as `ecalib -c VALUE`; the lower-level
+`--ecalib-options ... --end-ecalib-options` syntax belongs only to
+`recon/bart/run_wave_recon.sh` and is not a top-level Python option. Testing
+with the current Wave-MPRAGE implementation found `0.8–0.9` to be a reasonable
+practical range: `0.8` retains somewhat broader low-SNR support, while `0.9`
+applies a stricter support mask. Inspect the saved CSM magnitude and phase
+plots for each acquisition.
 
 When `--espirit-cpu-workers` is omitted, `slice2d` automatically uses the available physical-core count, capped by the number of logical-RO slices. Set it explicitly when sharing a machine, limiting memory use, or benchmarking, for example:
 

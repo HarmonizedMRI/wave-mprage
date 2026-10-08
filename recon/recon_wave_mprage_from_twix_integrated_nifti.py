@@ -113,6 +113,26 @@ def _current_psf_composition_provenance():
     }
 
 
+def _bart_coil_calibration_provenance(espirit_crop):
+    """Return the BART sensitivity-estimation identity used for safe resume.
+
+    Args:
+        espirit_crop: BART ecalib eigenvalue crop threshold.
+
+    Returns:
+        Manifest fields identifying PE alignment and BART map calibration.
+    """
+    return {
+        "refscan_to_imaging_pe_index_transform": (
+            REFSCAN_TO_IMAGING_PE_INDEX_TRANSFORM
+        ),
+        "bart_ecalib": {
+            "maps": 1,
+            "crop": float(espirit_crop),
+        },
+    }
+
+
 def main():
     cfg = _collect_runtime_config()
     data_folder = cfg["data_folder"]
@@ -199,11 +219,8 @@ def main():
         source_twix=mprage_data_file,
         source_seq=mprage_seq_file,
         expected_psf_composition=_current_psf_composition_provenance(),
-        expected_coil_calibration={
-            "refscan_to_imaging_pe_index_transform": (
-                REFSCAN_TO_IMAGING_PE_INDEX_TRANSFORM
-            )
-        },
+        expected_coil_calibration=_bart_coil_calibration_provenance(espirit_crop),
+        allow_legacy_provenance=np.isclose(espirit_crop, 0.8),
     ):
         print("Resume: current BART reconstruction is complete; skipping TWIX preprocessing.")
         _run_bart_reconstruction(
@@ -224,6 +241,7 @@ def main():
             file_tag=file_tag,
             yflip=yflip,
             zflip=zflip,
+            espirit_crop=espirit_crop,
             resume=resume,
         )
         print("Resume completed without rerunning BART reconstruction.")
@@ -346,6 +364,11 @@ def main():
                     "refscan_to_imaging_pe_index_transform": (
                         REFSCAN_TO_IMAGING_PE_INDEX_TRANSFORM
                     ),
+                    **(
+                        {"bart_ecalib": {"maps": 1, "crop": float(espirit_crop)}}
+                        if reconstruction_backend == "bart"
+                        else {}
+                    ),
                     "source_twix": str(Path(mprage_data_file).resolve()),
                     "source_seq": str(Path(mprage_seq_file).resolve()),
                     "oversampling_factor": int(os_factor),
@@ -374,6 +397,7 @@ def main():
                     file_tag=file_tag,
                     yflip=yflip,
                     zflip=zflip,
+                    espirit_crop=espirit_crop,
                     resume=resume,
                 )
                 print(f"Saved BART Wave-CAIPI reconstruction under: {bart_output_folder}")
@@ -2307,7 +2331,9 @@ def _parse_cli_args():
         default=None,
         help=(
             "ESPIRiT eigenvalue crop threshold. Lower values generally retain "
-            "a larger sensitivity-map support region. Default: 0.8."
+            "a larger sensitivity-map support region. Passed to BART ecalib "
+            "for the default BART backend and to SigPy for the SENSE backend. "
+            "Default: 0.8."
         ),
     )
     parser.add_argument(
@@ -2532,6 +2558,7 @@ def _run_bart_reconstruction(
     file_tag,
     yflip,
     zflip,
+    espirit_crop=0.8,
     resume=True,
 ):
     """Run the repository BART wrapper with its GPU wavelet/FISTA defaults."""
@@ -2550,6 +2577,10 @@ def _run_bart_reconstruction(
         str(twix_file),
         "--seq",
         str(seq_file),
+        "--ecalib-options",
+        "-c",
+        f"{float(espirit_crop):g}",
+        "--end-ecalib-options",
     ]
     if resume:
         command.append("--resume")
@@ -2805,6 +2836,7 @@ def _collect_runtime_config():
         print("  CG-SENSE:         CPU (explicit legacy backend)")
     else:
         print("  sensitivity maps: BART ecalib (SigPy ESPIRiT skipped)")
+        print(f"  BART ecalib crop: {espirit_crop_value:g}")
         print("  BART solver:      GPU wavelet/FISTA (-w -f -g)")
     print(f"  yflip/zflip:       {yflip_value}/{zflip_value}")
     print(f"  save_nifti:        {save_nifti_value}")

@@ -172,6 +172,20 @@ The final converter uses matching TWIX geometry and Pulseq metadata, restores
 the k-space norm removed internally by `bart wave`, and does not crop BART's
 already de-oversampled readout. Use `--help` for the complete interface.
 
+For CSM support inspection when anatomical orientation is not required, the
+lightweight converter needs only the BART map basename and an output path:
+
+```bash
+python recon/bart/csm_to_nifti_local.py \
+  --csm /path/to/coil_sens_bart \
+  --out /path/to/coil_sens_bart_rss.nii.gz \
+  --voxel-size 0.64 0.64 0.64
+```
+
+It writes RSS magnitude in unchanged logical `(RO, LIN, PAR)` order. Its affine
+is synthetic, so use `recon/bart/csm_to_nifti.py` with TWIX and sequence inputs
+when anatomical orientation must match the reconstruction.
+
 ## PSF coefficient processing
 
 For wave reconstruction, the projection calibration first estimates the readout-dependent phase-plane coefficients `a(kx)`, `b(kx)`, and `c(kx)`. The final coefficient-processing method is selected with:
@@ -288,7 +302,20 @@ Because `slice2d` estimates logical-RO positions independently, it is not mathem
 --espirit-crop FLOAT  eigenvalue support threshold; default 0.8
 ```
 
-The crop threshold is passed directly to SigPy in both `3d` and `slice2d` modes. Higher values apply a stricter support mask and set more low-eigenvalue locations to zero; lower values retain broader support. In `slice2d`, the crop is applied independently within each logical-RO plane.
+For the default BART backend, the crop threshold is passed to BART as
+`ecalib -c FLOAT`. For the explicit SENSE backend, it is passed directly to
+SigPy in both `3d` and `slice2d` modes. Higher values apply a stricter support
+mask and set more low-eigenvalue locations to zero; lower values retain broader
+support. In `slice2d`, the crop is applied independently within each logical-RO
+plane.
+
+Use `--espirit-crop FLOAT` with the integrated Python command. The delimited
+`--ecalib-options ... --end-ecalib-options` interface is available only when
+calling `recon/bart/run_wave_recon.sh` directly. BART crop provenance is stored
+in the manifest so resume rejects maps generated with a different recorded
+threshold. Legacy manifests remain reusable at the historical default `0.8`,
+but a requested non-default crop forces recalibration because its old value
+cannot be established safely.
 
 Testing with the current Wave-MPRAGE implementation found `0.8–0.9` to be a reasonable practical range:
 
@@ -296,7 +323,10 @@ Testing with the current Wave-MPRAGE implementation found `0.8–0.9` to be a re
 - use `0.9` when a somewhat stricter, cleaner support mask is preferred;
 - inspect the saved CSM magnitude and phase plots rather than selecting the value from background suppression alone.
 
-Changing `--espirit-crop` requires recomputing sensitivity maps. When `--reuse-coil-calib` loads an existing CSM cache, the new crop value is not reapplied.
+Changing `--espirit-crop` requires recomputing sensitivity maps. The integrated
+BART resume check now performs this invalidation automatically. When the SENSE
+backend's `--reuse-coil-calib` loads an existing CSM cache, the new crop value
+is not reapplied.
 
 ### Slice2d CPU workers
 
