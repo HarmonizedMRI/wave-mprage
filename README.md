@@ -217,7 +217,9 @@ NIfTI export is enabled by default in the integrated command; use
 `--no-save-nifti` to disable it. A rerun with the same TWIX, sequence, output
 directory, and tag automatically reuses complete, current BART maps and images
 instead of repeating preprocessing or reconstruction. `--resume` may be passed
-explicitly; use `--no-resume` to force reconstruction.
+explicitly; use `--no-resume` to force reconstruction. Complete legacy BART
+outputs without source-path provenance are validated and upgraded in place on
+their first resumed run.
 
 Force CPU ESPIRiT while explicitly requiring wave reconstruction:
 
