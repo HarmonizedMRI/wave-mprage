@@ -85,6 +85,11 @@ READOUT_OVERSAMPLING_REMOVAL = {
     "fft_normalization": "ortho",
 }
 
+# Calibration arrays increase from negative to positive physical PE, whereas
+# the matched MPRAGE image arrays use the opposite LIN and PAR convention.
+CALIBRATION_TO_IMAGING_PE_COORDINATE_SIGN = (-1, -1)
+PSF_COMPOSITION_VERSION = 2
+
 
 def main():
     cfg = _collect_runtime_config()
@@ -1991,7 +1996,8 @@ def generate_calibrated_psf(mprage_data_file, mprage_seq_file, out_folder, Nx_os
         figure.savefig(fig_path, dpi=150)
         plt.close(figure)
 
-    # generate theoretical psf on the final [Ny, Nz] grid
+    # Generate the imaging trajectory and map calibration coordinates onto the
+    # opposite PE polarity used by the matched MPRAGE image arrays.
     delta_ky_idx, delta_kz_idx = generate_theoretical_wave_trajectory(
         fn_seq=mprage_seq_file,
         Nx_os=Nx_os,
@@ -2000,42 +2006,140 @@ def generate_calibrated_psf(mprage_data_file, mprage_seq_file, out_folder, Nx_os
     )
     y_norm = (np.arange(Ny) - (Ny / 2.0)) / Ny
     z_norm = (np.arange(Nz) - (Nz / 2.0)) / Nz
-    psf_np = np.exp(-1j * yflip * 2.0 * np.pi * delta_ky_idx[:, None] * y_norm[None, :]).astype(np.complex64)
-    psf_np = psf_np[..., np.newaxis] * np.exp(
-        -1j * zflip * 2.0 * np.pi * delta_kz_idx[:, None, None] * z_norm[None, None, :]
-    ).astype(np.complex64)
-    psf_theory = torch.from_numpy(psf_np)
-
-    # generate calibrated psf
-    psf_diff_pred_new = torch.zeros_like(torch.angle(psf_theory))
-    Nx_os_psf = psf_theory.shape[0]
-    if a_fit.shape[0] != Nx_os_psf or b_fit.shape[0] != Nx_os_psf or c_fit.shape[0] != Nx_os_psf:
-        raise ValueError(
-            f"PSF fit length mismatch: a={a_fit.shape[0]}, b={b_fit.shape[0]}, c={c_fit.shape[0]}, "
-            f"but psf_theory has Nx_os={Nx_os_psf}."
-        )
-
-    y_norm_tensor = torch.from_numpy(y_norm)
-    z_norm_tensor = torch.from_numpy(z_norm)
-    Y_grid, Z_grid = torch.meshgrid(y_norm_tensor, z_norm_tensor, indexing='ij')
-
-    y_flat = Y_grid.flatten()
-    z_flat = Z_grid.flatten()
-
-    for kx_loc in range(Nx_os_psf):
-        ones = torch.ones_like(y_flat)
-        A_full = torch.stack([y_flat, z_flat, ones], dim=1)
-        coefficients = torch.Tensor((a_fit[kx_loc], b_fit[kx_loc], c_fit[kx_loc]))
-        coefficients = coefficients.to(dtype=A_full.dtype)
-
-        psf_diff_pred_flat = A_full @ coefficients
-        psf_diff_pred_new[kx_loc] = psf_diff_pred_flat.view(psf_theory[kx_loc].shape)
-
-    psf_diff_pred_new = torch.nan_to_num(psf_diff_pred_new.clone(), nan=0.0)
-    psf_calib = psf_theory * torch.exp(1j * psf_diff_pred_new)
+    psf_calib, psf_theory = _compose_calibrated_psf_on_imaging_grid(
+        delta_ky_idx=delta_ky_idx,
+        delta_kz_idx=delta_kz_idx,
+        y_norm=y_norm,
+        z_norm=z_norm,
+        a_fit=a_fit,
+        b_fit=b_fit,
+        c_fit=c_fit,
+        yflip=yflip,
+        zflip=zflip,
+    )
+    processing_diagnostics["psf_composition"] = {
+        "version": PSF_COMPOSITION_VERSION,
+        "calibration_to_imaging_pe_coordinate_sign": {
+            "LIN": CALIBRATION_TO_IMAGING_PE_COORDINATE_SIGN[0],
+            "PAR": CALIBRATION_TO_IMAGING_PE_COORDINATE_SIGN[1],
+        },
+        "constant_phase_sign": 1,
+    }
     if return_diagnostics:
         return psf_calib, psf_theory, processing_diagnostics
     return psf_calib, psf_theory
+
+
+def _compose_calibrated_psf_on_imaging_grid(
+    *,
+    delta_ky_idx,
+    delta_kz_idx,
+    y_norm,
+    z_norm,
+    a_fit,
+    b_fit,
+    c_fit,
+    yflip,
+    zflip,
+    coordinate_signs=CALIBRATION_TO_IMAGING_PE_COORDINATE_SIGN,
+):
+    """Compose the calibrated PSF in matched-MPRAGE array coordinates.
+
+    Args:
+        delta_ky_idx: Nominal LIN Wave trajectory in grid-index units.
+        delta_kz_idx: Nominal PAR Wave trajectory in grid-index units.
+        y_norm: Normalized LIN coordinates of the target imaging grid.
+        z_norm: Normalized PAR coordinates of the target imaging grid.
+        a_fit: Calibration-coordinate LIN deviation slopes by readout sample.
+        b_fit: Calibration-coordinate PAR deviation slopes by readout sample.
+        c_fit: Coordinate-independent phase deviations by readout sample.
+        yflip: Empirical LIN trajectory sign for the calibration arrays.
+        zflip: Empirical PAR trajectory sign for the calibration arrays.
+        coordinate_signs: LIN/PAR mappings from imaging coordinates to the
+            physical coordinates used by the calibration arrays.
+
+    Returns:
+        A tuple containing the calibrated PSF and nominal theoretical PSF as
+        complex64 tensors with shape ``(readout, LIN, PAR)``.
+
+    Raises:
+        ValueError: If coordinate signs or one-dimensional input lengths are
+            inconsistent.
+    """
+
+    if tuple(coordinate_signs) not in ((-1, -1), (-1, 1), (1, -1), (1, 1)):
+        raise ValueError("coordinate_signs must contain one +/-1 value per PE axis.")
+    y_coordinate_sign, z_coordinate_sign = map(int, coordinate_signs)
+
+    delta_ky_idx = np.asarray(delta_ky_idx, dtype=np.float64).reshape(-1)
+    delta_kz_idx = np.asarray(delta_kz_idx, dtype=np.float64).reshape(-1)
+    y_norm = np.asarray(y_norm, dtype=np.float64).reshape(-1)
+    z_norm = np.asarray(z_norm, dtype=np.float64).reshape(-1)
+    a_fit = np.asarray(torch.as_tensor(a_fit).detach().cpu(), dtype=np.float64).reshape(-1)
+    b_fit = np.asarray(torch.as_tensor(b_fit).detach().cpu(), dtype=np.float64).reshape(-1)
+    c_fit = np.asarray(torch.as_tensor(c_fit).detach().cpu(), dtype=np.float64).reshape(-1)
+
+    readout_lengths = {
+        delta_ky_idx.size,
+        delta_kz_idx.size,
+        a_fit.size,
+        b_fit.size,
+        c_fit.size,
+    }
+    if len(readout_lengths) != 1 or next(iter(readout_lengths)) < 1:
+        raise ValueError(
+            "PSF trajectory and fitted coefficients must have one shared, non-empty "
+            "readout length."
+        )
+    if y_norm.size < 1 or z_norm.size < 1:
+        raise ValueError("PSF target coordinates must be non-empty.")
+
+    psf_np = np.exp(
+        -1j
+        * yflip
+        * y_coordinate_sign
+        * 2.0
+        * np.pi
+        * delta_ky_idx[:, None]
+        * y_norm[None, :]
+    ).astype(np.complex64)
+    psf_np = psf_np[..., np.newaxis] * np.exp(
+        -1j
+        * zflip
+        * z_coordinate_sign
+        * 2.0
+        * np.pi
+        * delta_kz_idx[:, None, None]
+        * z_norm[None, None, :]
+    ).astype(np.complex64)
+    psf_theory = torch.from_numpy(psf_np)
+
+    y_grid, z_grid = torch.meshgrid(
+        torch.from_numpy(y_norm),
+        torch.from_numpy(z_norm),
+        indexing="ij",
+    )
+    design = torch.stack(
+        [y_grid.flatten(), z_grid.flatten(), torch.ones(y_grid.numel(), dtype=y_grid.dtype)],
+        dim=1,
+    )
+    psf_deviation = torch.empty_like(torch.angle(psf_theory))
+    for readout_index in range(delta_ky_idx.size):
+        coefficients = torch.tensor(
+            (
+                y_coordinate_sign * a_fit[readout_index],
+                z_coordinate_sign * b_fit[readout_index],
+                c_fit[readout_index],
+            ),
+            dtype=design.dtype,
+        )
+        psf_deviation[readout_index] = (design @ coefficients).reshape(
+            psf_theory[readout_index].shape
+        )
+
+    psf_deviation = torch.nan_to_num(psf_deviation, nan=0.0)
+    psf_calibrated = psf_theory * torch.exp(1j * psf_deviation)
+    return psf_calibrated, psf_theory
 
 
 # -----------------------------------------------------------------------------

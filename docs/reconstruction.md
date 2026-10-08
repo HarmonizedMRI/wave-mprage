@@ -181,6 +181,14 @@ For wave reconstruction, the projection calibration first estimates the readout-
 --psf-coefficient-processing sine-line
 ```
 
+The integrated calibration arrays increase from negative to positive physical
+LIN/PAR k-space, while the matched MPRAGE image arrays use the opposite PE
+polarity. PSF composition therefore reverses the theoretical LIN/PAR spatial
+phase and the fitted `a`/`b` slopes when mapping them to the imaging grid. The
+coordinate-independent `c` phase keeps its sign. BART's forward Wave operator
+then multiplies this imaging-grid PSF directly; the conjugate is used only by
+the adjoint operator.
+
 ### `smooth`
 
 The default path applies NaN-aware one-dimensional smoothing to the directly estimated coefficients. This preserves the established reconstruction behavior and should be used for routine data when the fitted coefficient curves remain stable across readout.

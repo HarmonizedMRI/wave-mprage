@@ -143,6 +143,72 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
             "slice2d_sagmask_roimgcrop_case",
         )
 
+    def test_psf_composition_maps_calibration_pe_polarity_to_imaging(self) -> None:
+        """Theory and spatial deviations should follow imaging PE polarity."""
+
+        delta_ky = np.array([0.35, -0.2])
+        delta_kz = np.array([-0.15, 0.4])
+        y_norm = np.array([-0.5, 0.0, 0.25])
+        z_norm = np.array([-0.5, 0.0])
+        a_fit = np.array([0.7, -0.3])
+        b_fit = np.array([-0.4, 0.2])
+        c_fit = np.array([0.25, -0.1])
+
+        calibrated, theory = reconstruction._compose_calibrated_psf_on_imaging_grid(
+            delta_ky_idx=delta_ky,
+            delta_kz_idx=delta_kz,
+            y_norm=y_norm,
+            z_norm=z_norm,
+            a_fit=a_fit,
+            b_fit=b_fit,
+            c_fit=c_fit,
+            yflip=1,
+            zflip=1,
+        )
+
+        image_y, image_z = np.meshgrid(y_norm, z_norm, indexing="ij")
+        calibration_y = -image_y
+        calibration_z = -image_z
+        expected_theory = np.exp(
+            -1j
+            * 2.0
+            * np.pi
+            * (
+                delta_ky[:, None, None] * calibration_y[None, ...]
+                + delta_kz[:, None, None] * calibration_z[None, ...]
+            )
+        )
+        expected_deviation = (
+            a_fit[:, None, None] * calibration_y[None, ...]
+            + b_fit[:, None, None] * calibration_z[None, ...]
+            + c_fit[:, None, None]
+        )
+
+        np.testing.assert_allclose(theory.numpy(), expected_theory, atol=1e-6)
+        np.testing.assert_allclose(
+            calibrated.numpy(),
+            expected_theory * np.exp(1j * expected_deviation),
+            atol=1e-6,
+        )
+
+    def test_psf_composition_preserves_constant_phase_sign(self) -> None:
+        """PE reversal should not conjugate coordinate-independent phase."""
+
+        calibrated, theory = reconstruction._compose_calibrated_psf_on_imaging_grid(
+            delta_ky_idx=np.zeros(1),
+            delta_kz_idx=np.zeros(1),
+            y_norm=np.array([-0.5, 0.0]),
+            z_norm=np.array([-0.5, 0.0]),
+            a_fit=np.zeros(1),
+            b_fit=np.zeros(1),
+            c_fit=np.array([0.4]),
+            yflip=1,
+            zflip=1,
+        )
+
+        np.testing.assert_allclose(theory.numpy(), 1.0, atol=1e-7)
+        np.testing.assert_allclose(calibrated.numpy(), np.exp(0.4j), atol=1e-7)
+
 
 if __name__ == "__main__":
     unittest.main()
