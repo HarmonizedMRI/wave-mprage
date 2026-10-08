@@ -179,7 +179,6 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
   --wave-mode auto \
   --file-tag test01 \
   --espirit-device auto \
-  --save-nifti \
   --save-nifti-phase
 ```
 
@@ -213,7 +212,11 @@ also be run independently; see
 [Reconstruction](docs/reconstruction.md#bart-wave-caipi-input-export) for the
 exact dimensions and command. It converts results with `python` from the active
 Conda environment or virtual environment, and writes NIfTIs to
-`BART_OUTPUT/nifti` unless `--skip-nifti` or an override is supplied.
+`BART_OUTPUT/nifti` unless `--skip-nifti` or an override is supplied. Magnitude
+NIfTI export is enabled by default in the integrated command; use
+`--no-save-nifti` to disable it. A rerun with the same TWIX, sequence, output
+directory, and tag automatically reuses complete, current BART maps and images
+instead of repeating preprocessing or reconstruction.
 
 Force CPU ESPIRiT while explicitly requiring wave reconstruction:
 

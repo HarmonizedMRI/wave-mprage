@@ -144,6 +144,11 @@ recon/bart/run_wave_recon.sh \
 Options inside the `--ecalib-options` and `--wave-options` sections are passed
 unchanged to the corresponding BART commands. The helper prints each complete
 command before running it. If `--wave-options` is omitted, it uses `-w -f -g`.
+Pass `--resume` when invoking the wrapper directly to retain complete CFL maps
+and images that are at least as new as their BART inputs. The integrated
+reconstruction enables this behavior automatically and, when every output is
+complete and current relative to the TWIX and sequence, skips TWIX
+preprocessing as well.
 Pass `--skip-nifti` to stop after BART reconstruction. Otherwise, if
 `--nifti-output` is omitted, converted files are
 written to `BART_OUTPUT/nifti`; pass the option only to override that location.
@@ -443,10 +448,10 @@ FOV and resolution are remapped in the same order.
 
 ## NIfTI export
 
-Enable magnitude export with:
+Magnitude export is enabled by default. Disable it with:
 
 ```text
---save-nifti
+--no-save-nifti
 ```
 
 Also export phase in radians with:

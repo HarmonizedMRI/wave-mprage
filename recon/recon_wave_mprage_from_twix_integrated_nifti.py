@@ -54,7 +54,7 @@ from scipy.ndimage import zoom
 from utils.twix_import import *
 from utils.coil_compression_kspace import *
 from utils.plot_coil_sens import *
-from bart.bart_utils.bart_io import export_wave_inputs
+from bart.bart_utils.bart_io import bart_reconstruction_is_current, export_wave_inputs
 from utils.espirit_calibration import estimate_espirit_maps
 
 from utils.psf_wrapped_phase_fit import fit_wrapped_phase_planes
@@ -158,6 +158,42 @@ def main():
             f"{nifti_voxel_size_mm[2]:g} mm"
         )
 
+    bart_tag = _sanitize_filename_component(file_tag) if file_tag else ""
+    bart_folder = Path(out_folder) / (
+        "bart_inputs" + (f"_{bart_tag}" if bart_tag else "")
+    )
+    bart_output_folder = Path(out_folder) / (
+        "bart_output" + (f"_{bart_tag}" if bart_tag else "")
+    )
+    if reconstruction_backend == "bart" and bart_reconstruction_is_current(
+        bart_folder,
+        bart_output_folder,
+        source_twix=mprage_data_file,
+        source_seq=mprage_seq_file,
+    ):
+        print("Resume: current BART reconstruction is complete; skipping TWIX preprocessing.")
+        _run_bart_reconstruction(
+            bart_input_folder=bart_folder,
+            bart_output_folder=bart_output_folder,
+            twix_file=mprage_data_file,
+            seq_file=mprage_seq_file,
+            save_nifti=save_nifti,
+            save_nifti_phase=save_nifti_phase,
+            nifti_out_folder=nifti_out_folder,
+            nifti_sub=nifti_sub,
+            nifti_suffix=nifti_suffix,
+            nifti_axis_roles=nifti_axis_roles,
+            nifti_axis_flips=nifti_axis_flips,
+            twix_coord_system=twix_coord_system,
+            twix_inplane_rot_sign=twix_inplane_rot_sign,
+            twix_use_fov_for_voxel_size=twix_use_fov_for_voxel_size,
+            file_tag=file_tag,
+            yflip=yflip,
+            zflip=zflip,
+        )
+        print("Resume completed without rerunning BART reconstruction.")
+        return
+
     logical_acs = None
     if reconstruction_backend == "bart":
         print("Preparing coil compression for BART; skipping SigPy ESPIRiT...")
@@ -253,10 +289,6 @@ def main():
         print("Generated calibrated PSF")
 
         if save_bart_inputs:
-            bart_tag = _sanitize_filename_component(file_tag) if file_tag else ""
-            bart_folder = Path(out_folder) / (
-                "bart_inputs" + (f"_{bart_tag}" if bart_tag else "")
-            )
             kspace_calib = _build_bart_calibration_kspace(
                 mprage_data_file=mprage_data_file,
                 Nx=Nx,
@@ -276,6 +308,8 @@ def main():
                 psf_calibration=psf_processing_diagnostics,
                 coil_calibration={
                     **READOUT_OVERSAMPLING_REMOVAL,
+                    "source_twix": str(Path(mprage_data_file).resolve()),
+                    "source_seq": str(Path(mprage_seq_file).resolve()),
                     "oversampling_factor": int(os_factor),
                     "input_readout": int(Nx * os_factor),
                     "output_readout": int(Nx),
@@ -284,9 +318,6 @@ def main():
             print(f"Saved BART Wave-CAIPI inputs: {manifest_path}")
 
             if reconstruction_backend == "bart":
-                bart_output_folder = Path(out_folder) / (
-                    "bart_output" + (f"_{bart_tag}" if bart_tag else "")
-                )
                 _run_bart_reconstruction(
                     bart_input_folder=bart_folder,
                     bart_output_folder=bart_output_folder,
@@ -2116,10 +2147,22 @@ def _parse_cli_args():
                         help="Sign convention for y wave PSF calibration. Default: -1.")
     parser.add_argument("--zflip", type=int, default=None,
                         help="Sign convention for z wave PSF calibration. Default: -1.")
-    parser.add_argument("--save-nifti", action="store_true",
-                        help="Also save the reconstructed image as NIfTI after center-cropping readout oversampling.")
+    nifti_group = parser.add_mutually_exclusive_group()
+    nifti_group.add_argument(
+        "--save-nifti",
+        dest="save_nifti",
+        action="store_true",
+        help="Save magnitude NIfTI output (default).",
+    )
+    nifti_group.add_argument(
+        "--no-save-nifti",
+        dest="save_nifti",
+        action="store_false",
+        help="Disable the default NIfTI conversion.",
+    )
+    parser.set_defaults(save_nifti=True)
     parser.add_argument("--save-nifti-phase", action="store_true",
-                        help="When --save-nifti is used, also save phase in radians. Magnitude is always saved.")
+                        help="Also save phase in radians; magnitude NIfTI is enabled by default.")
     parser.add_argument(
         "--save-bart-inputs",
         action="store_true",
@@ -2318,6 +2361,7 @@ def _run_bart_reconstruction(
         str(twix_file),
         "--seq",
         str(seq_file),
+        "--resume",
     ]
     if not save_nifti:
         command.append("--skip-nifti")
@@ -2470,12 +2514,8 @@ def _collect_runtime_config():
     yflip_value = _get_optional_int("yflip", cli.yflip, default=-1, allowed_values=(-1, 1))
     zflip_value = _get_optional_int("zflip", cli.zflip, default=-1, allowed_values=(-1, 1))
 
-    save_nifti_value = bool(
-        cli.save_nifti
-        or cli.save_nifti_phase
-        or globals().get("save_nifti", False)
-    )
     save_nifti_phase_value = bool(cli.save_nifti_phase or globals().get("save_nifti_phase", False))
+    save_nifti_value = bool(cli.save_nifti or save_nifti_phase_value)
 
     nifti_out_folder_value = cli.nifti_out_folder
     if nifti_out_folder_value is None and "nifti_out_folder" in globals() and globals()["nifti_out_folder"] not in (None, ""):

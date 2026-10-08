@@ -45,6 +45,13 @@ def _embed_center(array: np.ndarray, oversampling_factor: int) -> np.ndarray:
 class MprageCalibrationPipelineTests(unittest.TestCase):
     """Verify integration of corrected ACS processing with BART export."""
 
+    def test_nifti_is_enabled_by_default_and_can_be_disabled(self) -> None:
+        base = ["recon", "--twix", "input.dat", "--seq", "input.seq", "--out", "out"]
+        with mock.patch.object(sys, "argv", base):
+            self.assertTrue(reconstruction._parse_cli_args().save_nifti)
+        with mock.patch.object(sys, "argv", base + ["--no-save-nifti"]):
+            self.assertFalse(reconstruction._parse_cli_args().save_nifti)
+
     def test_integrated_bart_runner_uses_wrapper_defaults_and_skips_nifti(self) -> None:
         """The default backend should invoke BART without running local CG-SENSE."""
 
