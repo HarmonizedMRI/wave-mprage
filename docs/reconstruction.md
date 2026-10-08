@@ -181,13 +181,16 @@ For wave reconstruction, the projection calibration first estimates the readout-
 --psf-coefficient-processing sine-line
 ```
 
-The integrated calibration arrays increase from negative to positive physical
-LIN/PAR k-space, while the matched MPRAGE image arrays use the opposite PE
-polarity. PSF composition therefore reverses the theoretical LIN/PAR spatial
-phase and the fitted `a`/`b` slopes when mapping them to the imaging grid. The
-coordinate-independent `c` phase keeps its sign. BART's forward Wave operator
-then multiplies this imaging-grid PSF directly; the conjugate is used only by
-the adjoint operator.
+After `yflip` and `zflip` select the empirical calibration-trajectory signs,
+the fitted projection planes and the imaging trajectory already use the same
+matched-MPRAGE LIN/PAR array convention. PSF composition therefore applies no
+additional PE-coordinate reversal: the theoretical spatial phase and fitted
+`a`/`b` slopes retain their signs, as does the coordinate-independent `c`
+phase. BART's forward Wave operator multiplies this imaging-grid PSF directly;
+the conjugate is used only by the adjoint operator. The manifest records this
+versioned composition identity so resume rejects outputs made with a recorded,
+incompatible PSF polarity while retaining compatibility with older manifests
+that predate this provenance field.
 
 ### `smooth`
 

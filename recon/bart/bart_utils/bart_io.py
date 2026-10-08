@@ -110,8 +110,14 @@ def bart_reconstruction_is_current(
     *,
     source_twix: str | Path,
     source_seq: str | Path,
+    expected_psf_composition: Mapping[str, Any] | None = None,
 ) -> bool:
-    """Return true when BART maps and every manifest echo are complete/current."""
+    """Return true when BART maps and every manifest echo are complete/current.
+
+    A recorded PSF-composition identity must match the requested identity.
+    Manifests created before PSF-composition provenance was introduced remain
+    eligible for the full source, timestamp, and CFL-integrity validation.
+    """
 
     input_path = Path(input_dir)
     output_path = Path(output_dir)
@@ -121,13 +127,34 @@ def bart_reconstruction_is_current(
     legacy_provenance = False
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, Mapping):
+            return False
         provenance = manifest.get("coil_calibration", {})
+        if not isinstance(provenance, Mapping):
+            return False
         recorded_twix = provenance.get("source_twix")
         recorded_seq = provenance.get("source_seq")
         legacy_provenance = recorded_twix is None and recorded_seq is None
         if not legacy_provenance:
             if recorded_twix != str(twix_path) or recorded_seq != str(seq_path):
                 return False
+        if expected_psf_composition is not None:
+            psf_calibration = manifest.get("psf_calibration")
+            if psf_calibration is not None and not isinstance(psf_calibration, Mapping):
+                return False
+            recorded_composition = (
+                None
+                if psf_calibration is None
+                else psf_calibration.get("psf_composition")
+            )
+            if recorded_composition is not None:
+                if not isinstance(recorded_composition, Mapping):
+                    return False
+                if any(
+                    recorded_composition.get(key) != value
+                    for key, value in expected_psf_composition.items()
+                ):
+                    return False
         source_latest = max(twix_path.stat().st_mtime_ns, seq_path.stat().st_mtime_ns)
         calib_times = _cfl_pair_times(input_path / "kspace_calib")
         maps_times = _cfl_pair_times(output_path / "coil_sens_bart")

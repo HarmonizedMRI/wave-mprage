@@ -85,10 +85,25 @@ READOUT_OVERSAMPLING_REMOVAL = {
     "fft_normalization": "ortho",
 }
 
-# Calibration arrays increase from negative to positive physical PE, whereas
-# the matched MPRAGE image arrays use the opposite LIN and PAR convention.
-CALIBRATION_TO_IMAGING_PE_COORDINATE_SIGN = (-1, -1)
-PSF_COMPOSITION_VERSION = 2
+# The fitted projection planes and the imaging trajectory already share the
+# matched-MPRAGE LIN/PAR array convention after applying yflip and zflip.  No
+# additional PE-coordinate reversal belongs in PSF composition.
+CALIBRATION_TO_IMAGING_PE_COORDINATE_SIGN = (1, 1)
+PSF_COMPOSITION_VERSION = 3
+
+
+def _current_psf_composition_provenance():
+    """Return the manifest identity of the PSF used by BART's forward model."""
+
+    return {
+        "version": PSF_COMPOSITION_VERSION,
+        "calibration_to_imaging_pe_coordinate_sign": {
+            "LIN": CALIBRATION_TO_IMAGING_PE_COORDINATE_SIGN[0],
+            "PAR": CALIBRATION_TO_IMAGING_PE_COORDINATE_SIGN[1],
+        },
+        "constant_phase_sign": 1,
+        "bart_forward_application": "direct",
+    }
 
 
 def main():
@@ -176,6 +191,7 @@ def main():
         bart_output_folder,
         source_twix=mprage_data_file,
         source_seq=mprage_seq_file,
+        expected_psf_composition=_current_psf_composition_provenance(),
     ):
         print("Resume: current BART reconstruction is complete; skipping TWIX preprocessing.")
         _run_bart_reconstruction(
@@ -1996,8 +2012,8 @@ def generate_calibrated_psf(mprage_data_file, mprage_seq_file, out_folder, Nx_os
         figure.savefig(fig_path, dpi=150)
         plt.close(figure)
 
-    # Generate the imaging trajectory and map calibration coordinates onto the
-    # opposite PE polarity used by the matched MPRAGE image arrays.
+    # Generate the imaging trajectory and compose the calibrated phase on the
+    # same matched-MPRAGE PE grid used by BART's forward operator.
     delta_ky_idx, delta_kz_idx = generate_theoretical_wave_trajectory(
         fn_seq=mprage_seq_file,
         Nx_os=Nx_os,
@@ -2017,14 +2033,9 @@ def generate_calibrated_psf(mprage_data_file, mprage_seq_file, out_folder, Nx_os
         yflip=yflip,
         zflip=zflip,
     )
-    processing_diagnostics["psf_composition"] = {
-        "version": PSF_COMPOSITION_VERSION,
-        "calibration_to_imaging_pe_coordinate_sign": {
-            "LIN": CALIBRATION_TO_IMAGING_PE_COORDINATE_SIGN[0],
-            "PAR": CALIBRATION_TO_IMAGING_PE_COORDINATE_SIGN[1],
-        },
-        "constant_phase_sign": 1,
-    }
+    processing_diagnostics["psf_composition"] = (
+        _current_psf_composition_provenance()
+    )
     if return_diagnostics:
         return psf_calib, psf_theory, processing_diagnostics
     return psf_calib, psf_theory

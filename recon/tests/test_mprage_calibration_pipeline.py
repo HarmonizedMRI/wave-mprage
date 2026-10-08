@@ -143,8 +143,8 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
             "slice2d_sagmask_roimgcrop_case",
         )
 
-    def test_psf_composition_maps_calibration_pe_polarity_to_imaging(self) -> None:
-        """Theory and spatial deviations should follow imaging PE polarity."""
+    def test_psf_composition_uses_matched_imaging_pe_polarity(self) -> None:
+        """Theory and fitted slopes should use the BART imaging PE grid directly."""
 
         delta_ky = np.array([0.35, -0.2])
         delta_kz = np.array([-0.15, 0.4])
@@ -167,20 +167,18 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
         )
 
         image_y, image_z = np.meshgrid(y_norm, z_norm, indexing="ij")
-        calibration_y = -image_y
-        calibration_z = -image_z
         expected_theory = np.exp(
             -1j
             * 2.0
             * np.pi
             * (
-                delta_ky[:, None, None] * calibration_y[None, ...]
-                + delta_kz[:, None, None] * calibration_z[None, ...]
+                delta_ky[:, None, None] * image_y[None, ...]
+                + delta_kz[:, None, None] * image_z[None, ...]
             )
         )
         expected_deviation = (
-            a_fit[:, None, None] * calibration_y[None, ...]
-            + b_fit[:, None, None] * calibration_z[None, ...]
+            a_fit[:, None, None] * image_y[None, ...]
+            + b_fit[:, None, None] * image_z[None, ...]
             + c_fit[:, None, None]
         )
 
@@ -190,9 +188,21 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
             expected_theory * np.exp(1j * expected_deviation),
             atol=1e-6,
         )
+        self.assertEqual(
+            reconstruction._current_psf_composition_provenance(),
+            {
+                "version": 3,
+                "calibration_to_imaging_pe_coordinate_sign": {
+                    "LIN": 1,
+                    "PAR": 1,
+                },
+                "constant_phase_sign": 1,
+                "bart_forward_application": "direct",
+            },
+        )
 
     def test_psf_composition_preserves_constant_phase_sign(self) -> None:
-        """PE reversal should not conjugate coordinate-independent phase."""
+        """Spatial phase conventions should not conjugate the constant term."""
 
         calibrated, theory = reconstruction._compose_calibrated_psf_on_imaging_grid(
             delta_ky_idx=np.zeros(1),
