@@ -348,15 +348,21 @@ def main():
             espirit_cpu_workers=espirit_cpu_workers,
         )
 
-    print("Importing image data from integrated TWIX file...")
-    img = load_img(mprage_data_file)
-    if not torch.is_tensor(img):
-        img = torch.as_tensor(img)
-    _check_image_data_shape(img, Nx_os, Ny, Nz)
+    print(
+        "Importing and coil-compressing image data in bounded PAR chunks..."
+    )
+    kspace_cc_echo, acquired_image_shape, Ncoil = load_img_coil_compressed(
+        mprage_data_file,
+        Wcc,
+        output_shape=(Nx_os, Ny, Nz),
+        par_chunk=1,
+    )
+    print(f"Acquired physical-coil image shape: {acquired_image_shape}")
+    print(f"Compressed padded image shape: {tuple(kspace_cc_echo.shape)}")
     geometry_diagnostics = _report_seq_twix_geometry(
         twix_file=mprage_data_file,
         geom=geom,
-        received_image_shape=tuple(int(v) for v in img.shape),
+        received_image_shape=tuple(int(v) for v in acquired_image_shape),
         os_factor=os_factor,
         voxel_size_mm=nifti_voxel_size_mm,
         twix_array_axis_roles=nifti_axis_roles,
@@ -364,20 +370,13 @@ def main():
         twix_coord_system=twix_coord_system,
         twix_inplane_rot_sign=twix_inplane_rot_sign,
     )
-    Ncoil = int(img.shape[-1])
-
     if Ncoil_ref != Ncoil:
         raise ValueError(
             f"Image/refscan coil-count mismatch: image data has {Ncoil} coils, "
             f"but refscan/ACS data has {Ncoil_ref} coils."
         )
 
-    print(f'Importing data, Ry={Ry}, Rz={Rz}')
-    kspace_cc_acquired = apply_cc_coillast_torch(img, Wcc, x_chunk=8)
     ncc = int(Wcc.shape[1])
-    kspace_cc_echo = torch.zeros((Nx_os, Ny, Nz, ncc), dtype=torch.cfloat)
-    kspace_cc_echo[:, :img.shape[1], :img.shape[2], :] = kspace_cc_acquired
-    del kspace_cc_acquired, img
     gc.collect()
     kspace_cc_file = (
         out_folder + 'kspace_' + tag_wave + '_cc_' +
@@ -1236,9 +1235,10 @@ def load_or_generate_coil_sens(
         Wcc = np.load(wcc_file)
         print(f"Loading CSM from: {csm_file}")
         csm_full_cc_np = np.load(csm_file)
-        ref_data = load_ref(mprage_data_file)
-        _check_integrated_refscan_shape(ref_data, Nacs=Nacs, Ncalib=None)
-        Ncoil = int(ref_data.shape[-1])
+        ref_acs = load_ref_set(
+            mprage_data_file, -1, lin_count=Nacs, par_count=Nacs
+        )
+        Ncoil = int(ref_acs.shape[-1])
         effective_ncc = _resolve_virtual_coil_count(ncc, Ncoil)
         if Wcc.shape != (Ncoil, effective_ncc) or not np.isfinite(Wcc).all():
             raise ValueError(
@@ -1305,9 +1305,12 @@ def load_or_generate_coil_compression_for_bart(
     ncc = int(ncc)
     if ncc < 0:
         raise ValueError("ncc cannot be negative.")
-    data_ref = load_ref(mprage_data_file)
-    _check_integrated_refscan_shape(data_ref, Nacs=Nacs, Ncalib=None)
-    kspace_acs = data_ref[:, :Nacs, :Nacs, -1, :]
+    kspace_acs = load_ref_set(
+        mprage_data_file,
+        -1,
+        lin_count=Nacs,
+        par_count=Nacs,
+    )
     logical_acs = remove_readout_oversampling_kspace(
         kspace_acs, os_factor, axis=0
     ).contiguous()
@@ -1351,7 +1354,7 @@ def load_or_generate_coil_compression_for_bart(
             "coil compression matrix",
         )
 
-    del data_ref, kspace_acs
+    del kspace_acs
     gc.collect()
     return np.asarray(Wcc), logical_acs, ncoil
 
@@ -1424,9 +1427,9 @@ def generate_coil_sens(
         )
 
     # The integrated refscan layout uses the last set for ACS.
-    data_ref = load_ref(mprage_data_file)
-    _check_integrated_refscan_shape(data_ref, Nacs=Nacs, Ncalib=None)
-    kspace_nowave_acs = data_ref[:, :Nacs, :Nacs, -1, :]
+    kspace_nowave_acs = load_ref_set(
+        mprage_data_file, -1, lin_count=Nacs, par_count=Nacs
+    )
     Nx_os, Ny_acs, Nz_acs, Ncoil = kspace_nowave_acs.shape
     effective_ncc = _resolve_virtual_coil_count(ncc, Ncoil)
     kspace_nowave_logical = remove_readout_oversampling_kspace(
@@ -1591,9 +1594,9 @@ def _build_bart_calibration_kspace(
     """Return compressed integrated ACS on BART's full logical image grid."""
 
     if logical_acs is None:
-        data_ref = load_ref(mprage_data_file)
-        _check_integrated_refscan_shape(data_ref, Nacs=Nacs, Ncalib=None)
-        kspace_acs = data_ref[:, :Nacs, :Nacs, -1, :]
+        kspace_acs = load_ref_set(
+            mprage_data_file, -1, lin_count=Nacs, par_count=Nacs
+        )
         kspace_acs_logical = remove_readout_oversampling_kspace(
             kspace_acs, os_factor, axis=0
         )
@@ -1799,9 +1802,35 @@ def fit_wave_psf_deviation_from_projection(mprage_data_file, mprage_seq_file, ou
         ``return_diagnostics`` is true, a fifth structured evidence mapping is
         appended.
     """
-    data_ref = load_ref(mprage_data_file)
-    _check_integrated_refscan_shape(data_ref, Nacs=Nacs, Ncalib=Ncalib)
-    Nx_os, _, _, _, Ncoil = data_ref.shape
+    projection_ref = {
+        "sin": (
+            load_ref_set(mprage_data_file, 0, lin_count=Ncalib, par_count=1),
+            load_ref_set(mprage_data_file, 1, lin_count=Ncalib, par_count=1),
+        ),
+        "cos": (
+            load_ref_set(mprage_data_file, 2, lin_count=1, par_count=Ncalib),
+            load_ref_set(mprage_data_file, 3, lin_count=1, par_count=Ncalib),
+        ),
+    }
+    Nx_os = int(projection_ref["sin"][0].shape[0])
+    Ncoil = int(projection_ref["sin"][0].shape[-1])
+    expected_projection_shapes = {
+        "sin": (Nx_os, Ncalib, 1, Ncoil),
+        "cos": (Nx_os, 1, Ncalib, Ncoil),
+    }
+    if any(
+        tuple(array.shape) != expected_projection_shapes[name]
+        for name, pair in projection_ref.items()
+        for array in pair
+    ):
+        received = {
+            name: [tuple(array.shape) for array in pair]
+            for name, pair in projection_ref.items()
+        }
+        raise ValueError(
+            "Integrated projection REFSCAN sets have incompatible shapes: "
+            f"received={received}, expected={expected_projection_shapes}."
+        )
 
     seq = pp.Sequence()
     seq.read(mprage_seq_file, remove_duplicates=False)
@@ -1832,8 +1861,7 @@ def fit_wave_psf_deviation_from_projection(mprage_data_file, mprage_seq_file, ou
     for wave_mode in ['sin', 'cos']:
         print(f'Calibrating wave trajectory of {wave_mode}')
         if wave_mode == 'sin':
-            kspace_nowave_echo = data_ref[:, :Ncalib, :1, 0, :]
-            kspace_wave_echo = data_ref[:, :Ncalib, :1, 1, :]
+            kspace_nowave_echo, kspace_wave_echo = projection_ref["sin"]
             ky_adc_sin = k_adc[1, Ncalib * 1:Ncalib * 2]
             delta_ky = ky_adc_sin[Ncalib // 2]
             delta_ky_idx = delta_ky * fov_y
@@ -1843,8 +1871,7 @@ def fit_wave_psf_deviation_from_projection(mprage_data_file, mprage_seq_file, ou
             psf_theory = torch.from_numpy(psf_np_sin[..., np.newaxis])
 
         elif wave_mode == 'cos':
-            kspace_nowave_echo = data_ref[:, :1, :Ncalib, 2, :]
-            kspace_wave_echo = data_ref[:, :1, :Ncalib, 3, :]
+            kspace_nowave_echo, kspace_wave_echo = projection_ref["cos"]
             kz_adc_cos = k_adc[0, Ncalib * 3:Ncalib * 4]
             delta_kz = kz_adc_cos[Ncalib // 2]
             delta_kz_idx = delta_kz * fov_z

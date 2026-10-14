@@ -122,7 +122,7 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
 
         integrated_ref = torch.ones((8, 2, 2, 5, 3), dtype=torch.complex64)
         with tempfile.TemporaryDirectory() as folder, mock.patch.object(
-            reconstruction, "load_ref", return_value=integrated_ref
+            reconstruction, "load_ref_set", return_value=integrated_ref[:, :, :, -1, :]
         ), mock.patch.object(reconstruction, "estimate_cc_matrix_coillast") as estimate:
             wcc, logical_acs, ncoil = (
                 reconstruction.load_or_generate_coil_compression_for_bart(
@@ -229,7 +229,11 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
         integrated_ref[:, :, :, -1, :] = torch.from_numpy(raw_acs)
         compression = np.eye(3, dtype=np.complex64)[:, :2]
 
-        with mock.patch.object(reconstruction, "load_ref", return_value=integrated_ref):
+        with mock.patch.object(
+            reconstruction,
+            "load_ref_set",
+            return_value=integrated_ref[:, :, :, -1, :],
+        ):
             actual = reconstruction._build_bart_calibration_kspace(
                 mprage_data_file="unused.dat",
                 Nx=4,
