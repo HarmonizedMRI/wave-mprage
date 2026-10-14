@@ -85,6 +85,22 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
             ):
                 self.assertEqual(reconstruction._parse_cli_args().ncc, 16)
 
+    def test_no_vcc_cli_disables_compression_and_is_mutually_exclusive(self) -> None:
+        """The no-VCC switch should retain all coils and reject a count."""
+
+        base = ["recon", "--twix", "input.dat", "--seq", "input.seq", "--out", "out"]
+        for option in ("--no-coil-compression", "--no-vcc"):
+            with self.subTest(option=option), mock.patch.object(
+                sys, "argv", base + [option]
+            ):
+                self.assertTrue(reconstruction._parse_cli_args().no_coil_compression)
+        with mock.patch.object(
+            sys,
+            "argv",
+            base + ["--no-vcc", "--vcc-channels", "16"],
+        ), self.assertRaises(SystemExit):
+            reconstruction._parse_cli_args()
+
     def test_bart_provenance_records_virtual_coil_count(self) -> None:
         """BART resume identity must distinguish different compression sizes."""
 
@@ -94,6 +110,38 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
             ],
             {"virtual_coils": 16},
         )
+        self.assertEqual(
+            reconstruction._bart_coil_calibration_provenance(0.5, 0)[
+                "coil_compression"
+            ],
+            {"mode": "identity", "virtual_coils": "all"},
+        )
+
+    def test_no_vcc_builds_identity_basis_without_estimating_pca(self) -> None:
+        """Disabling compression should preserve every physical channel."""
+
+        integrated_ref = torch.ones((8, 2, 2, 5, 3), dtype=torch.complex64)
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(
+            reconstruction, "load_ref", return_value=integrated_ref
+        ), mock.patch.object(reconstruction, "estimate_cc_matrix_coillast") as estimate:
+            wcc, logical_acs, ncoil = (
+                reconstruction.load_or_generate_coil_compression_for_bart(
+                    mprage_data_file="unused.dat",
+                    os_factor=2,
+                    out_folder=folder + "/",
+                    file_tag="",
+                    Nacs=2,
+                    ncc=0,
+                )
+            )
+
+            estimate.assert_not_called()
+            self.assertEqual(ncoil, 3)
+            self.assertEqual(tuple(logical_acs.shape), (4, 2, 2, 3))
+            np.testing.assert_array_equal(wcc, np.eye(3, dtype=np.complex64))
+            self.assertTrue(
+                (Path(folder) / "coil_compression_energy_nccall_roimgcrop.npy").is_file()
+            )
 
     def test_integrated_bart_runner_uses_wrapper_defaults_and_skips_nifti(self) -> None:
         """The default backend should invoke BART without running local CG-SENSE."""
@@ -216,6 +264,10 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
         self.assertEqual(
             reconstruction._coil_compression_cache_tag("case", 16),
             "ncc16_roimgcrop_case",
+        )
+        self.assertEqual(
+            reconstruction._coil_compression_cache_tag("case", 0),
+            "nccall_roimgcrop_case",
         )
         self.assertEqual(
             reconstruction._espirit_cache_tag("case", "3d", 16),

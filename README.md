@@ -76,7 +76,9 @@ apply only when `--reconstruction-backend sense` is selected;
 `--espirit-crop` configures either BART `ecalib` or SigPy, according to the
 selected reconstruction backend. Use `--coil-compression-channels N` to retain
 a non-default number of virtual coils; `--vcc-channels` and `--ncc` are aliases.
-The default remains 12.
+The default remains 12. Use `--no-vcc` (alias `--no-coil-compression`) to retain
+all physical receiver channels without SVD compression; this can substantially
+increase BART memory use.
 
 ## Clone
 

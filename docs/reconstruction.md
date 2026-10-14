@@ -332,12 +332,17 @@ Because `slice2d` estimates logical-RO positions independently, it is not mathem
 --coil-compression-channels N  virtual coils retained after SVD compression; default 12
 --vcc-channels N               compatibility alias
 --ncc N                        compatibility alias
+--no-vcc                       retain all physical channels without compression
+--no-coil-compression          descriptive alias for --no-vcc
 ```
 
 The selected count is used by both BART and SENSE backends. Cache filenames
 and BART manifest provenance include the value, so changing it cannot silently
 reuse a compression matrix, sensitivity map, or completed reconstruction from
 a different count. The value must not exceed the physical receiver count.
+The no-VCC mode uses an identity physical-to-virtual basis and `nccall` cache
+names. It can require much more CPU/GPU memory, especially during BART `ecalib`
+and Wave reconstruction.
 
 ### ESPIRiT crop threshold
 
