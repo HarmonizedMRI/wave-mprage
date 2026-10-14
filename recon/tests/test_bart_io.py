@@ -8,7 +8,9 @@ from pathlib import Path
 import numpy as np
 
 from recon.bart.bart_utils.bart_io import (
+    bart_cartesian_inputs_are_current,
     bart_cartesian_reconstruction_is_current,
+    bart_reconstruction_inputs_are_current,
     bart_reconstruction_is_current,
     export_cartesian_inputs,
     export_wave_inputs,
@@ -62,6 +64,23 @@ class BartIoTests(unittest.TestCase):
                     "source_seq": str(sequence.resolve()),
                 },
             )
+            self.assertTrue(
+                bart_cartesian_inputs_are_current(
+                    inputs,
+                    source_twix=twix,
+                    source_seq=sequence,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
+                )
+            )
+            self.assertFalse(
+                bart_cartesian_reconstruction_is_current(
+                    inputs,
+                    outputs,
+                    source_twix=twix,
+                    source_seq=sequence,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
+                )
+            )
             write_cfl(outputs / "coil_sens_bart", np.ones((4, 3, 2, 2), np.complex64))
             image = write_cfl(outputs / "image_nowave", np.ones((4, 3, 2), np.complex64))
 
@@ -94,6 +113,23 @@ class BartIoTests(unittest.TestCase):
                 bart_cartesian_reconstruction_is_current(
                     inputs,
                     outputs,
+                    source_twix=twix,
+                    source_seq=sequence,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
+                )
+            )
+            self.assertTrue(
+                bart_cartesian_inputs_are_current(
+                    inputs,
+                    source_twix=twix,
+                    source_seq=sequence,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
+                )
+            )
+            (inputs / "cartesian_kspace.cfl").write_bytes(b"\x00" * 8)
+            self.assertFalse(
+                bart_cartesian_inputs_are_current(
+                    inputs,
                     source_twix=twix,
                     source_seq=sequence,
                     expected_coil_calibration=CURRENT_COIL_CALIBRATION,
@@ -183,6 +219,25 @@ class BartIoTests(unittest.TestCase):
                     "psf_composition": CURRENT_PSF_COMPOSITION,
                 },
             )
+            self.assertTrue(
+                bart_reconstruction_inputs_are_current(
+                    inputs,
+                    source_twix=twix,
+                    source_seq=sequence,
+                    expected_psf_composition=CURRENT_PSF_COMPOSITION,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
+                )
+            )
+            self.assertFalse(
+                bart_reconstruction_is_current(
+                    inputs,
+                    outputs,
+                    source_twix=twix,
+                    source_seq=sequence,
+                    expected_psf_composition=CURRENT_PSF_COMPOSITION,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
+                )
+            )
             write_cfl(outputs / "coil_sens_bart", np.ones((4, 3, 2, 2), np.complex64))
             image = write_cfl(outputs / "image_wave", np.ones((4, 3, 2), np.complex64))
 
@@ -239,6 +294,25 @@ class BartIoTests(unittest.TestCase):
                 bart_reconstruction_is_current(
                     inputs,
                     outputs,
+                    source_twix=twix,
+                    source_seq=sequence,
+                    expected_psf_composition=CURRENT_PSF_COMPOSITION,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
+                )
+            )
+            self.assertTrue(
+                bart_reconstruction_inputs_are_current(
+                    inputs,
+                    source_twix=twix,
+                    source_seq=sequence,
+                    expected_psf_composition=CURRENT_PSF_COMPOSITION,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
+                )
+            )
+            (inputs / "psf.cfl").write_bytes(b"\x00" * 8)
+            self.assertFalse(
+                bart_reconstruction_inputs_are_current(
+                    inputs,
                     source_twix=twix,
                     source_seq=sequence,
                     expected_psf_composition=CURRENT_PSF_COMPOSITION,

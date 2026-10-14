@@ -56,7 +56,9 @@ from utils.twix_import import *
 from utils.coil_compression_kspace import *
 from utils.plot_coil_sens import *
 from bart.bart_utils.bart_io import (
+    bart_cartesian_inputs_are_current,
     bart_cartesian_reconstruction_is_current,
+    bart_reconstruction_inputs_are_current,
     bart_reconstruction_is_current,
     export_cartesian_inputs,
     export_wave_inputs,
@@ -223,6 +225,7 @@ def main():
         "bart_output" + (f"_{bart_tag}" if bart_tag else "")
     )
     bart_resume_current = False
+    bart_inputs_current = False
     if resume and reconstruction_backend == "bart":
         if tag_wave == "wave":
             bart_resume_current = bart_reconstruction_is_current(
@@ -238,6 +241,17 @@ def main():
                     np.isclose(espirit_crop, 0.8) and ncc_requested == 12
                 ),
             )
+            if not bart_resume_current:
+                bart_inputs_current = bart_reconstruction_inputs_are_current(
+                    bart_folder,
+                    source_twix=mprage_data_file,
+                    source_seq=mprage_seq_file,
+                    expected_psf_composition=_current_psf_composition_provenance(),
+                    expected_coil_calibration=_bart_coil_calibration_provenance(
+                        espirit_crop, ncc_requested
+                    ),
+                    allow_legacy_provenance=False,
+                )
         else:
             bart_resume_current = bart_cartesian_reconstruction_is_current(
                 bart_folder,
@@ -249,8 +263,27 @@ def main():
                 ),
                 allow_legacy_provenance=False,
             )
-    if bart_resume_current:
-        print("Resume: current BART reconstruction is complete; skipping TWIX preprocessing.")
+            if not bart_resume_current:
+                bart_inputs_current = bart_cartesian_inputs_are_current(
+                    bart_folder,
+                    source_twix=mprage_data_file,
+                    source_seq=mprage_seq_file,
+                    expected_coil_calibration=_bart_coil_calibration_provenance(
+                        espirit_crop, ncc_requested
+                    ),
+                    allow_legacy_provenance=False,
+                )
+    if bart_resume_current or bart_inputs_current:
+        if bart_resume_current:
+            print(
+                "Resume: current BART reconstruction is complete; skipping "
+                "TWIX preprocessing."
+            )
+        else:
+            print(
+                "Resume: current BART inputs are complete; skipping TWIX "
+                "preprocessing and resuming missing BART outputs."
+            )
         bart_runner = (
             _run_bart_reconstruction
             if tag_wave == "wave"
@@ -277,7 +310,10 @@ def main():
             espirit_crop=espirit_crop,
             resume=resume,
         )
-        print("Resume completed without rerunning BART reconstruction.")
+        if bart_resume_current:
+            print("Resume completed without rerunning BART reconstruction.")
+        else:
+            print("Interrupted BART reconstruction resumed from current inputs.")
         return
 
     logical_acs = None

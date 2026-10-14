@@ -135,6 +135,33 @@ printf '\0\0\0\0\0\0\0\0' > "$output.cfl"
         )
         self.assertIn("BART GPU defaults", result.stdout)
 
+    def test_resume_rejects_truncated_pics_output(self) -> None:
+        """A nonempty but undersized PICS image must be reconstructed again."""
+
+        command = [
+            "bash",
+            str(SCRIPT),
+            "--bart-input",
+            str(self.inputs),
+            "--bart-output",
+            str(self.outputs),
+            "--maps-source",
+            "bart",
+            "--twix",
+            str(self.twix),
+            "--seq",
+            str(self.sequence),
+            "--skip-nifti",
+        ]
+        subprocess.run(command, check=True, env=self.environment)
+        (self.outputs / "image_nowave.cfl").write_bytes(b"\x00")
+        self.bart_log.unlink()
+
+        subprocess.run(command + ["--resume"], check=True, env=self.environment)
+
+        calls = _read_calls(self.bart_log)
+        self.assertEqual(calls[-1][0], "pics")
+
 
 if __name__ == "__main__":
     unittest.main()

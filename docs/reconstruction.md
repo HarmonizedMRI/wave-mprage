@@ -150,9 +150,10 @@ unchanged to the corresponding BART commands. The helper prints each complete
 command before running it. If `--wave-options` is omitted, it uses `-w -f -g`.
 Pass `--resume` when invoking the wrapper directly to retain complete CFL maps
 and images that are at least as new as their BART inputs. The integrated
-reconstruction enables this behavior automatically and, when every output is
-complete and current relative to the TWIX and sequence, skips TWIX
-preprocessing as well.
+reconstruction enables this behavior automatically. It skips TWIX
+preprocessing both when every output is current and when modern, provenance-
+matched BART inputs are complete but maps or images are missing after an
+interrupted run. Partial resume does not infer provenance for legacy inputs.
 Pass `--skip-nifti` to stop after BART reconstruction. Otherwise, if
 `--nifti-output` is omitted, converted files are
 written to `BART_OUTPUT/nifti`; pass the option only to override that location.
