@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a BART Wave-MPRAGE CFL image to a geometry-correct NIfTI."""
+"""Convert BART Wave or Cartesian MPRAGE CFL images to NIfTI."""
 
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ def _parse_bool(value: str | bool) -> bool:
 
 
 def discover_bart_echoes(input_dir: str | Path, output_dir: str | Path) -> list[dict[str, Any]]:
-    """Resolve the manifest's single matched k-space and reconstructed image pair."""
+    """Resolve one manifest-matched k-space and reconstructed image pair."""
 
     input_path = Path(input_dir)
     output_path = Path(output_dir)
@@ -44,18 +44,38 @@ def discover_bart_echoes(input_dir: str | Path, output_dir: str | Path) -> list[
     entry = entries[0]
     if int(entry.get("echo", -1)) != 1:
         raise ValueError("Wave-MPRAGE BART manifest echo must be numbered 1.")
-    kspace_name = str(entry.get("wave_kspace", ""))
-    if kspace_name != "wave_kspace":
-        raise ValueError(
-            f"Invalid Wave-MPRAGE wave_kspace basename: {kspace_name!r}"
-        )
-    suffix = kspace_name[len("wave_kspace") :]
+    reconstruction = manifest.get("reconstruction", {})
+    mode = "cartesian" if reconstruction.get("mode") == "cartesian" else "wave"
+    if mode == "cartesian":
+        kspace_name = str(entry.get("cartesian_kspace", ""))
+        if kspace_name != "cartesian_kspace":
+            raise ValueError(
+                f"Invalid no-wave Cartesian k-space basename: {kspace_name!r}"
+            )
+        image_name = "image_nowave"
+    else:
+        kspace_name = str(entry.get("wave_kspace", ""))
+        if kspace_name != "wave_kspace":
+            raise ValueError(
+                f"Invalid Wave-MPRAGE wave_kspace basename: {kspace_name!r}"
+            )
+        image_name = "image_wave"
     kspace_base = input_path / kspace_name
-    image_base = output_path / f"image_wave{suffix}"
+    image_base = output_path / image_name
     for base in (kspace_base, image_base):
         if not base.with_suffix(".hdr").is_file() or not base.with_suffix(".cfl").is_file():
             raise FileNotFoundError(f"Missing BART CFL pair: {base}.{{hdr,cfl}}")
-    return [{"echo": 1, "wave_kspace": kspace_base, "image": image_base}]
+    result = {
+        "echo": 1,
+        "mode": mode,
+        "kspace": kspace_base,
+        "image": image_base,
+    }
+    if mode == "wave":
+        result["wave_kspace"] = kspace_base
+    else:
+        result["cartesian_kspace"] = kspace_base
+    return [result]
 
 
 def restore_bart_intensity(image: np.ndarray, wave_kspace: np.ndarray) -> tuple[np.ndarray, float]:
@@ -69,7 +89,7 @@ def restore_bart_intensity(image: np.ndarray, wave_kspace: np.ndarray) -> tuple[
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Convert a BART Wave-MPRAGE image using matching TWIX/Pulseq geometry.",
+        description="Convert a BART MPRAGE image using matching TWIX/Pulseq geometry.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--bart-input-dir", required=True)
@@ -132,9 +152,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if image.shape != expected_shape:
         raise ValueError(f"BART image has shape {image.shape}; expected {expected_shape}.")
-    restored_image, kspace_norm = restore_bart_intensity(
-        image, read_cfl(entry["wave_kspace"])
-    )
+    if entry["mode"] == "wave":
+        restored_image, kspace_norm = restore_bart_intensity(
+            image, read_cfl(entry["kspace"])
+        )
+    else:
+        # Cartesian PICS is called with -S, which restores its internal scale.
+        restored_image = np.asarray(image, dtype=np.complex64)
+        kspace_norm = None
 
     voxel_size_mm = native._derive_nifti_voxel_size_mm(defs, geom)
     geometry_diagnostics = native._report_seq_twix_geometry(
@@ -155,8 +180,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     rz = int(defs.get("MPRAGE_PE1_R", 3))
     ncalib = int(defs.get("Calibration_Ncalib1", 72))
     nacs = int(defs.get("Calibration_Nacs", 32))
+    tag_wave = "wave" if entry["mode"] == "wave" else "nowave"
+    reconstruction_software = "BART wave" if tag_wave == "wave" else "BART pics"
     metadata = native._build_mprage_nifti_metadata(
-        tag_wave="wave",
+        tag_wave=tag_wave,
         file_tag=args.file_tag,
         defs=defs,
         geom=geom,
@@ -172,16 +199,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     metadata.update(
         {
-            "ReconstructionSoftware": "BART wave",
+            "ReconstructionSoftware": reconstruction_software,
             "BARTImageInput": entry["image"].name,
-            "BARTWaveKspaceInput": entry["wave_kspace"].name,
-            "BARTWaveKspaceNormRestored": kspace_norm,
+            "BARTKspaceInput": entry["kspace"].name,
             "BARTInternalNormalizationRestored": True,
             "BARTOutputAlreadyReadoutDeoversampled": True,
         }
     )
+    if tag_wave == "wave":
+        metadata["BARTWaveKspaceInput"] = entry["kspace"].name
+        metadata["BARTWaveKspaceNormRestored"] = kspace_norm
+    else:
+        metadata["BARTCartesianKspaceInput"] = entry["kspace"].name
+        metadata["BARTPICSScaleRestoredByOption"] = "-S"
     nifti_sub = args.nifti_sub or native._default_nifti_sub(
-        "wave",
+        tag_wave,
         geom["res_ro"],
         geom["res_lin"],
         geom["res_par"],
@@ -195,7 +227,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         out_folder=nifti_out,
         nifti_sub=nifti_sub,
         suffix=native._sanitize_filename_component(args.nifti_suffix),
-        tag_wave="wave",
+        tag_wave=tag_wave,
         file_tag=args.file_tag,
         voxel_size_mm=voxel_size_mm,
         crop_readout_os=1,
@@ -207,7 +239,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         twix_use_fov_for_voxel_size=bool(args.twix_use_fov_for_voxel_size),
         metadata=metadata,
     )
-    print(f"Converted BART Wave-MPRAGE image to {nifti_out}")
+    print(f"Converted BART {tag_wave} MPRAGE image to {nifti_out}")
     return 0
 
 

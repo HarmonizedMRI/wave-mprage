@@ -35,6 +35,44 @@ class BartWaveToNiftiTests(unittest.TestCase):
         self.assertEqual(scale, 3.0)
         np.testing.assert_array_equal(restored, image * 3.0)
 
+    def test_discovers_cartesian_nowave_output(self) -> None:
+        """Cartesian manifests should resolve PICS inputs without a PSF."""
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            inputs = root / "inputs"
+            outputs = root / "outputs"
+            inputs.mkdir()
+            outputs.mkdir()
+            write_cfl(
+                inputs / "cartesian_kspace",
+                np.ones((2, 2, 2, 1, 1), np.complex64),
+            )
+            write_cfl(
+                outputs / "image_nowave",
+                np.ones((2, 2, 2, 1, 1), np.complex64),
+            )
+            (inputs / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "reconstruction": {
+                            "mode": "cartesian",
+                            "tool": "pics",
+                            "readout_oversampling_removed": True,
+                        },
+                        "echoes": [
+                            {"echo": 1, "cartesian_kspace": "cartesian_kspace"}
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            resolved = discover_bart_echoes(inputs, outputs)[0]
+            self.assertEqual(resolved["mode"], "cartesian")
+            self.assertEqual(resolved["image"].name, "image_nowave")
+            self.assertEqual(resolved["kspace"].name, "cartesian_kspace")
+
 
 if __name__ == "__main__":
     unittest.main()

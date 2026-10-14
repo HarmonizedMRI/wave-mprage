@@ -8,7 +8,9 @@ from pathlib import Path
 import numpy as np
 
 from recon.bart.bart_utils.bart_io import (
+    bart_cartesian_reconstruction_is_current,
     bart_reconstruction_is_current,
+    export_cartesian_inputs,
     export_wave_inputs,
     read_cfl,
     write_cfl,
@@ -29,6 +31,7 @@ CURRENT_COIL_CALIBRATION = {
         "roll_after_flip": 1,
     },
     "bart_ecalib": {"maps": 1, "crop": 0.8},
+    "coil_compression": {"virtual_coils": 2},
 }
 
 
@@ -37,6 +40,66 @@ def _read_cfl(base: Path) -> np.ndarray:
 
 
 class BartIoTests(unittest.TestCase):
+    def test_cartesian_export_and_resume_validate_exact_cfl_size(self) -> None:
+        """Cartesian resume should require provenance and complete PICS output."""
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            inputs = root / "inputs"
+            outputs = root / "outputs"
+            twix = root / "input.dat"
+            sequence = root / "input.seq"
+            twix.touch()
+            sequence.touch()
+            manifest_path = export_cartesian_inputs(
+                inputs,
+                cartesian_kspace=np.ones((4, 3, 2, 1, 2), np.complex64),
+                coil_sens=None,
+                kspace_calib=np.ones((4, 3, 2, 2), np.complex64),
+                coil_calibration={
+                    **CURRENT_COIL_CALIBRATION,
+                    "source_twix": str(twix.resolve()),
+                    "source_seq": str(sequence.resolve()),
+                },
+            )
+            write_cfl(outputs / "coil_sens_bart", np.ones((4, 3, 2, 2), np.complex64))
+            image = write_cfl(outputs / "image_nowave", np.ones((4, 3, 2), np.complex64))
+
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                manifest["reconstruction"],
+                {
+                    "mode": "cartesian",
+                    "tool": "pics",
+                    "readout_oversampling_removed": True,
+                },
+            )
+            self.assertEqual(
+                _read_cfl(inputs / "cartesian_kspace").shape,
+                (4, 3, 2, 2, 1),
+            )
+            self.assertNotIn("psf", manifest["echoes"][0])
+            self.assertTrue(
+                bart_cartesian_reconstruction_is_current(
+                    inputs,
+                    outputs,
+                    source_twix=twix,
+                    source_seq=sequence,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
+                )
+            )
+
+            image.with_suffix(".cfl").write_bytes(b"\x00" * 8)
+            self.assertFalse(
+                bart_cartesian_reconstruction_is_current(
+                    inputs,
+                    outputs,
+                    source_twix=twix,
+                    source_seq=sequence,
+                    expected_coil_calibration=CURRENT_COIL_CALIBRATION,
+                )
+            )
+
     def test_complete_legacy_reconstruction_is_reused_and_manifest_is_upgraded(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -131,6 +194,19 @@ class BartIoTests(unittest.TestCase):
                     source_seq=sequence,
                     expected_psf_composition=CURRENT_PSF_COMPOSITION,
                     expected_coil_calibration=CURRENT_COIL_CALIBRATION,
+                )
+            )
+            self.assertFalse(
+                bart_reconstruction_is_current(
+                    inputs,
+                    outputs,
+                    source_twix=twix,
+                    source_seq=sequence,
+                    expected_psf_composition=CURRENT_PSF_COMPOSITION,
+                    expected_coil_calibration={
+                        **CURRENT_COIL_CALIBRATION,
+                        "coil_compression": {"virtual_coils": 3},
+                    },
                 )
             )
             self.assertFalse(

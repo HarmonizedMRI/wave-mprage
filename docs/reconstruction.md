@@ -106,10 +106,14 @@ The old `--data-folder` argument is not part of the direct-path interface. Suppl
    integrated ACS for `bart ecalib`.
 8. Only for the explicit SENSE backend, estimate and interpolate SigPy ESPIRiT maps.
 9. For wave data, fit the FLASH projection phase deviation and construct the calibrated wave PSF.
-10. By default, run `bart ecalib`, then `bart wave -w -f -g` (GPU wavelet/FISTA).
-11. When `--reconstruction-backend sense` is explicitly selected, run the
+10. For no-wave data, use a centered readout IFFT, central image-domain crop
+    by the sequence oversampling factor (normally four), and centered FFT to
+    produce alias-free logical-grid Cartesian k-space.
+11. By default, run `bart ecalib`, followed by `bart wave -w -f -g` for wave
+    data or GPU `bart pics` for no-wave data.
+12. When `--reconstruction-backend sense` is explicitly selected, run the
     legacy wave or no-wave CG-SENSE solver on CPU.
-12. Save backend-appropriate outputs, diagnostic plots, and optional NIfTI outputs.
+13. Save backend-appropriate outputs, diagnostic plots, and optional NIfTI outputs.
 
 ## BART Wave-CAIPI input export
 
@@ -171,6 +175,31 @@ recon/bart/run_wave_recon.sh \
 The final converter uses matching TWIX geometry and Pulseq metadata, restores
 the k-space norm removed internally by `bart wave`, and does not crop BART's
 already de-oversampled readout. Use `--help` for the complete interface.
+
+### BART no-wave Cartesian input and PICS
+
+No-wave data contain no PSF. Before export, the acquired readout k-space is
+converted to the nominal grid as follows:
+
+```text
+centered IFFT along RO -> central 1/os_factor image crop -> centered FFT along RO
+```
+
+For the standard `ReadoutOversamplingFactor=4`, the retained image-domain RO
+extent is exactly the central one quarter. This avoids the aliasing caused by
+selecting every fourth k-space sample. The resulting input is written as
+`cartesian_kspace` with shape `(Nx, Ny, Nz, Ncc, 1)`; the reconstruction output
+is `image_nowave`. The integrated command invokes `run_cartesian_recon.sh`,
+whose default PICS options are:
+
+```text
+-l1 -r 1e-5 --fista -i 300 -g -S
+```
+
+Thus GPU execution is enabled by default, and `-S` restores BART's internal
+data scaling before NIfTI conversion. The lower-level wrapper accepts an
+explicit delimited override through
+`--pics-options ... --end-pics-options`.
 
 For CSM support inspection when anatomical orientation is not required, the
 lightweight converter needs only the BART map basename and an output path:
@@ -279,6 +308,7 @@ The current implementation does not move the full reconstruction to GPU.
 | Default sensitivity-map calibration | BART `ecalib` |
 | Native `3d` / `slice2d` SigPy ESPIRiT | Explicit SENSE backend only |
 | Default Wave reconstruction | BART GPU wavelet/FISTA |
+| Default no-wave reconstruction | BART Cartesian GPU PICS |
 | Explicit legacy Wave/no-wave CG-SENSE | CPU / PyTorch tensor |
 
 ### ESPIRiT calibration mode
@@ -292,9 +322,22 @@ The current implementation does not move the full reconstruction to GPU.
 
 `slice2d` is an optional CPU-only acceleration path. For both calibration modes, the integrated ACS is first transformed along the full oversampled readout, center-cropped in image space to the nominal FOV, and transformed back to logical readout k-space. Coil-compression estimation and ESPIRiT therefore use the same alias-free logical ACS ordered as `(coil, RO, LIN, PAR)`. `slice2d` then inverse-transforms logical RO and runs independent 2D ESPIRiT calibrations over the joint LIN-PAR plane. This preserves calibration coupling across both accelerated phase-encoding dimensions while removing coupling only along the fully sampled readout direction.
 
-Directly selecting every fourth readout k-space sample is not equivalent to removing fourfold readout oversampling: it aliases the extended readout FOV into the nominal FOV. The reconstruction does not use that legacy stride operation for coil calibration. The acquired Wave image k-space and PSF retain their oversampled readout because the Wave forward model requires it; only the ACS used for compression, ESPIRiT, and exported BART calibration input is converted to the logical readout grid.
+Directly selecting every fourth readout k-space sample is not equivalent to removing fourfold readout oversampling: it aliases the extended readout FOV into the nominal FOV. The reconstruction does not use that legacy stride operation. The acquired Wave image k-space and PSF retain their oversampled readout because the Wave forward model requires it; the ACS and no-wave Cartesian image k-space are converted to the logical readout grid by centered image-domain cropping.
 
 Because `slice2d` estimates logical-RO positions independently, it is not mathematically identical to joint 3D ESPIRiT. Validate representative datasets by comparing CSM support, magnitude and phase continuity along logical RO, low-SNR anterior anatomy, final reconstruction differences, runtime, and peak memory.
+
+### Virtual coil count
+
+```text
+--coil-compression-channels N  virtual coils retained after SVD compression; default 12
+--vcc-channels N               compatibility alias
+--ncc N                        compatibility alias
+```
+
+The selected count is used by both BART and SENSE backends. Cache filenames
+and BART manifest provenance include the value, so changing it cannot silently
+reuse a compression matrix, sensitivity map, or completed reconstruction from
+a different count. The value must not exceed the physical receiver count.
 
 ### ESPIRiT crop threshold
 
@@ -421,8 +464,7 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
   --twix /path/to/data/meas_integrated_nowave_mprage.dat \
   --seq /path/to/data/mprage_3d_flashcalib_nowave.seq \
   --out /path/to/output \
-  --wave-mode nowave \
-  --espirit-device auto
+  --wave-mode nowave
 ```
 
 ### Require GPU 1
@@ -458,9 +500,9 @@ This reuses the coil-compression matrix and the CSM cache for the selected ESPIR
 For `--file-tag test01`, the corrected cache names are:
 
 ```text
-compression: coil_compression_energy_roimgcrop_test01.npy
-3d CSM:     csm_full_roimgcrop_test01.npy
-slice2d CSM: csm_full_slice2d_sagmask_roimgcrop_test01.npy
+compression: coil_compression_energy_ncc12_roimgcrop_test01.npy
+3d CSM:     csm_full_ncc12_pealign_roimgcrop_test01.npy
+slice2d CSM: csm_full_ncc12_slice2d_sagmask_pealign_roimgcrop_test01.npy
 ```
 
 The `roimgcrop` identity prevents corrected runs from silently reusing legacy stride-derived PCA or CSM caches. The mode-specific names also prevent a `slice2d` run from silently reusing a 3D CSM, or vice versa. The coil-compression matrix remains shared between ESPIRiT modes because calibration mode does not change coil compression. Use cached files only when the TWIX measurement, acquisition geometry, coil configuration, ACS data, compression settings, reconstruction dimensions, ESPIRiT mode, and intended crop setting match. A different `--espirit-crop` value is not applied to a reused map.
@@ -535,6 +577,6 @@ The output folder may contain:
 - CSM magnitude and phase plots
 - coil-compressed MPRAGE k-space
 - PSF phase-fit arrays and plots
-- BART Wave-CAIPI CFL images by default
+- BART Wave-CAIPI or Cartesian PICS CFL images by default
 - wave or no-wave CG-SENSE image as `.npy` with the explicit SENSE backend
 - optional magnitude and phase NIfTI files and JSON sidecars

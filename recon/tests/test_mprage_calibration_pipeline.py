@@ -75,6 +75,26 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
         with mock.patch.object(sys, "argv", argv):
             self.assertEqual(reconstruction._parse_cli_args().espirit_crop, 0.5)
 
+    def test_virtual_coil_count_accepts_all_supported_cli_names(self) -> None:
+        """Canonical and compatibility names should configure the same value."""
+
+        base = ["recon", "--twix", "input.dat", "--seq", "input.seq", "--out", "out"]
+        for option in ("--coil-compression-channels", "--vcc-channels", "--ncc"):
+            with self.subTest(option=option), mock.patch.object(
+                sys, "argv", base + [option, "16"]
+            ):
+                self.assertEqual(reconstruction._parse_cli_args().ncc, 16)
+
+    def test_bart_provenance_records_virtual_coil_count(self) -> None:
+        """BART resume identity must distinguish different compression sizes."""
+
+        self.assertEqual(
+            reconstruction._bart_coil_calibration_provenance(0.5, 16)[
+                "coil_compression"
+            ],
+            {"virtual_coils": 16},
+        )
+
     def test_integrated_bart_runner_uses_wrapper_defaults_and_skips_nifti(self) -> None:
         """The default backend should invoke BART without running local CG-SENSE."""
 
@@ -103,6 +123,42 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIn("--skip-nifti", command)
         self.assertNotIn("--wave-options", command)
+        ecalib_start = command.index("--ecalib-options")
+        self.assertEqual(
+            command[ecalib_start : ecalib_start + 4],
+            ["--ecalib-options", "-c", "0.5", "--end-ecalib-options"],
+        )
+        run.assert_called_once_with(command, check=True)
+
+    def test_integrated_cartesian_runner_uses_wrapper_defaults(self) -> None:
+        """The no-wave runner should delegate PICS options to its GPU wrapper."""
+
+        with mock.patch.object(reconstruction.subprocess, "run") as run:
+            reconstruction._run_bart_cartesian_reconstruction(
+                bart_input_folder=Path("inputs"),
+                bart_output_folder=Path("outputs"),
+                twix_file=Path("input.dat"),
+                seq_file=Path("input.seq"),
+                save_nifti=False,
+                save_nifti_phase=False,
+                nifti_out_folder=Path("nifti"),
+                nifti_sub=None,
+                nifti_suffix="MPRAGE",
+                nifti_axis_roles=("phase", "readout", "slice"),
+                nifti_axis_flips=(True, False, False),
+                twix_coord_system="LPS",
+                twix_inplane_rot_sign=-1.0,
+                twix_use_fov_for_voxel_size=False,
+                file_tag="",
+                yflip=-1,
+                zflip=-1,
+                espirit_crop=0.5,
+            )
+
+        command = run.call_args.args[0]
+        self.assertTrue(command[1].endswith("run_cartesian_recon.sh"))
+        self.assertIn("--skip-nifti", command)
+        self.assertNotIn("--pics-options", command)
         ecalib_start = command.index("--ecalib-options")
         self.assertEqual(
             command[ecalib_start : ecalib_start + 4],
@@ -158,16 +214,16 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
         """Corrected PCA and CSM caches should have distinct identities."""
 
         self.assertEqual(
-            reconstruction._coil_compression_cache_tag("case"),
-            "roimgcrop_case",
+            reconstruction._coil_compression_cache_tag("case", 16),
+            "ncc16_roimgcrop_case",
         )
         self.assertEqual(
-            reconstruction._espirit_cache_tag("case", "3d"),
-            "pealign_roimgcrop_case",
+            reconstruction._espirit_cache_tag("case", "3d", 16),
+            "ncc16_pealign_roimgcrop_case",
         )
         self.assertEqual(
-            reconstruction._espirit_cache_tag("case", "slice2d"),
-            "slice2d_sagmask_pealign_roimgcrop_case",
+            reconstruction._espirit_cache_tag("case", "slice2d", 16),
+            "ncc16_slice2d_sagmask_pealign_roimgcrop_case",
         )
 
     def test_refscan_alignment_is_centered_lin_par_reversal(self) -> None:

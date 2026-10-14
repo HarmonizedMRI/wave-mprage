@@ -28,6 +28,7 @@ The repository has two intentionally separate parts:
 │   ├── recon_wave_mprage_from_twix_integrated_nifti.py
 │   ├── bart/
 │   │   ├── run_wave_recon.sh
+│   │   ├── run_cartesian_recon.sh
 │   │   ├── wave_to_nifti.py
 │   │   └── bart_utils/
 │   ├── tests/
@@ -55,7 +56,7 @@ Optional scanner-safety checks can use Safe PNS Prediction, a scanner `.asc` fil
 
 - Python 3.11
 - CPU reconstruction environment defined in `pyproject.toml`
-- GPU-enabled BART and an NVIDIA GPU for the default `bart wave -g` path
+- GPU-enabled BART and an NVIDIA GPU for the default BART reconstruction path
 - Optional CUDA 12-compatible CuPy only for GPU SigPy ESPIRiT in the explicit SENSE path
 
 The current execution model is:
@@ -65,13 +66,17 @@ The current execution model is:
 | Coil-compression matrix estimation and application | CPU |
 | Default sensitivity-map calibration | BART `ecalib`; SigPy ESPIRiT is skipped |
 | Default Wave reconstruction | BART GPU wavelet/FISTA (`-w -f -g`) |
+| Default no-wave reconstruction | BART Cartesian GPU PICS (`-l1 -r 1e-5 --fista -i 300 -g -S`) |
 | Explicit legacy Wave/no-wave CG-SENSE | CPU |
 
-The default BART backend requires a BART build with GPU support because it
-invokes `bart wave -w -f -g`. SigPy-specific ESPIRiT device, mode, and worker
-options apply only when `--reconstruction-backend sense` is selected;
+The default BART backend requires a BART build with GPU support. It invokes
+`bart wave -w -f -g` for Wave acquisitions and `bart pics ... -g` for no-wave
+Cartesian acquisitions. SigPy-specific ESPIRiT device, mode, and worker options
+apply only when `--reconstruction-backend sense` is selected;
 `--espirit-crop` configures either BART `ecalib` or SigPy, according to the
-selected reconstruction backend.
+selected reconstruction backend. Use `--coil-compression-channels N` to retain
+a non-default number of virtual coils; `--vcc-channels` and `--ncc` are aliases.
+The default remains 12.
 
 ## Clone
 
@@ -206,8 +211,11 @@ detects sustained coefficient corruption. Supply both `--psf-fit-kx-min` and
 for the selection, validation, diagnostics, and failure contracts.
 
 Wave acquisitions export the calibrated PSF, coil-compressed k-space, and
-integrated ACS as BART CFL pairs by default. They skip SigPy ESPIRiT, run BART
-`ecalib`, and then run GPU wavelet/FISTA reconstruction. Select
+integrated ACS as BART CFL pairs by default. No-wave acquisitions first remove
+fourfold readout oversampling by centered IFFT, central image-domain crop, and
+centered FFT, then export Cartesian k-space without a PSF. Both paths skip
+SigPy ESPIRiT, run BART `ecalib`, and then run GPU wavelet/FISTA reconstruction.
+Select
 `--reconstruction-backend sense` only when the traditional local CG-SENSE
 solver is required. The companion `recon/bart/run_wave_recon.sh` script can
 also be run independently; see
@@ -268,6 +276,7 @@ uv run python recon/recon_wave_mprage_from_twix_integrated_nifti.py \
   --seq /path/to/data/mprage_3d_flashcalib_wave.seq \
   --out /path/to/output \
   --wave-mode auto \
+  --coil-compression-channels 16 \
   --espirit-device cpu \
   --espirit-calib-mode slice2d \
   --espirit-crop 0.8

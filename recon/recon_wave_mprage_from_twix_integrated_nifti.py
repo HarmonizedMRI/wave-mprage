@@ -11,9 +11,10 @@ Description:
     file and Pulseq sequence are used for the image data, integrated refscan
     ACS data, and integrated wave PSF calibration projections.
 
-    The default reconstruction pipeline exports calibrated Wave-CAIPI inputs
-    and runs BART with wavelet regularization and FISTA. The legacy local
-    CG-SENSE solver remains available as an explicit backend.
+    The default reconstruction pipeline runs BART with wavelet regularization
+    and FISTA: ``bart wave`` for Wave-CAIPI data and Cartesian ``bart pics``
+    for no-wave data. The legacy local CG-SENSE solver remains available as
+    an explicit backend.
 
 Notes:
     - This script assumes the integrated refscan layout uses the first four
@@ -54,7 +55,12 @@ from scipy.ndimage import zoom
 from utils.twix_import import *
 from utils.coil_compression_kspace import *
 from utils.plot_coil_sens import *
-from bart.bart_utils.bart_io import bart_reconstruction_is_current, export_wave_inputs
+from bart.bart_utils.bart_io import (
+    bart_cartesian_reconstruction_is_current,
+    bart_reconstruction_is_current,
+    export_cartesian_inputs,
+    export_wave_inputs,
+)
 from utils.espirit_calibration import estimate_espirit_maps
 
 from utils.psf_wrapped_phase_fit import fit_wrapped_phase_planes
@@ -113,11 +119,12 @@ def _current_psf_composition_provenance():
     }
 
 
-def _bart_coil_calibration_provenance(espirit_crop):
+def _bart_coil_calibration_provenance(espirit_crop, ncc):
     """Return the BART sensitivity-estimation identity used for safe resume.
 
     Args:
         espirit_crop: BART ecalib eigenvalue crop threshold.
+        ncc: Number of virtual coils retained after coil compression.
 
     Returns:
         Manifest fields identifying PE alignment and BART map calibration.
@@ -130,6 +137,7 @@ def _bart_coil_calibration_provenance(espirit_crop):
             "maps": 1,
             "crop": float(espirit_crop),
         },
+        "coil_compression": {"virtual_coils": int(ncc)},
     }
 
 
@@ -142,6 +150,7 @@ def main():
     file_tag = cfg["file_tag"]
     tag_wave = cfg["tag_wave"]
     reuse_coil_calib = cfg["reuse_coil_calib"]
+    ncc_requested = cfg["ncc"]
     espirit_device = cfg["espirit_device"]
     espirit_gpu_index = cfg["espirit_gpu_index"]
     espirit_crop = cfg["espirit_crop"]
@@ -213,17 +222,41 @@ def main():
     bart_output_folder = Path(out_folder) / (
         "bart_output" + (f"_{bart_tag}" if bart_tag else "")
     )
-    if resume and reconstruction_backend == "bart" and bart_reconstruction_is_current(
-        bart_folder,
-        bart_output_folder,
-        source_twix=mprage_data_file,
-        source_seq=mprage_seq_file,
-        expected_psf_composition=_current_psf_composition_provenance(),
-        expected_coil_calibration=_bart_coil_calibration_provenance(espirit_crop),
-        allow_legacy_provenance=np.isclose(espirit_crop, 0.8),
-    ):
+    bart_resume_current = False
+    if resume and reconstruction_backend == "bart":
+        if tag_wave == "wave":
+            bart_resume_current = bart_reconstruction_is_current(
+                bart_folder,
+                bart_output_folder,
+                source_twix=mprage_data_file,
+                source_seq=mprage_seq_file,
+                expected_psf_composition=_current_psf_composition_provenance(),
+                expected_coil_calibration=_bart_coil_calibration_provenance(
+                    espirit_crop, ncc_requested
+                ),
+                allow_legacy_provenance=(
+                    np.isclose(espirit_crop, 0.8) and ncc_requested == 12
+                ),
+            )
+        else:
+            bart_resume_current = bart_cartesian_reconstruction_is_current(
+                bart_folder,
+                bart_output_folder,
+                source_twix=mprage_data_file,
+                source_seq=mprage_seq_file,
+                expected_coil_calibration=_bart_coil_calibration_provenance(
+                    espirit_crop, ncc_requested
+                ),
+                allow_legacy_provenance=False,
+            )
+    if bart_resume_current:
         print("Resume: current BART reconstruction is complete; skipping TWIX preprocessing.")
-        _run_bart_reconstruction(
+        bart_runner = (
+            _run_bart_reconstruction
+            if tag_wave == "wave"
+            else _run_bart_cartesian_reconstruction
+        )
+        bart_runner(
             bart_input_folder=bart_folder,
             bart_output_folder=bart_output_folder,
             twix_file=mprage_data_file,
@@ -256,6 +289,7 @@ def main():
             out_folder=out_folder,
             file_tag=file_tag,
             Nacs=nacs,
+            ncc=ncc_requested,
             reuse_coil_calib=reuse_coil_calib,
         )
         csm_full_cc_np = None
@@ -269,6 +303,7 @@ def main():
             out_folder=out_folder,
             file_tag=file_tag,
             Nacs=nacs,
+            ncc=ncc_requested,
             reuse_coil_calib=reuse_coil_calib,
             espirit_device=espirit_device,
             espirit_gpu_index=espirit_gpu_index,
@@ -374,6 +409,7 @@ def main():
                     "oversampling_factor": int(os_factor),
                     "input_readout": int(Nx * os_factor),
                     "output_readout": int(Nx),
+                    "coil_compression": {"virtual_coils": int(ncc_requested)},
                 },
             )
             print(f"Saved BART Wave-CAIPI inputs: {manifest_path}")
@@ -475,6 +511,81 @@ def main():
             )
 
     elif tag_wave == 'nowave':
+        if reconstruction_backend == "bart":
+            print(
+                "Removing readout oversampling for BART PICS using centered "
+                f"IFFT, central 1/{os_factor} image-domain crop, and centered FFT..."
+            )
+            kspace_cc_logical = torch.empty(
+                (Nx, Ny, Nz, ncc), dtype=kspace_cc_echo.dtype
+            )
+            # Process two compressed coils at a time to bound FFT workspace.
+            for coil_start in range(0, ncc, 2):
+                coil_stop = min(coil_start + 2, ncc)
+                kspace_cc_logical[..., coil_start:coil_stop] = (
+                    remove_readout_oversampling_kspace(
+                        kspace_cc_echo[..., coil_start:coil_stop],
+                        os_factor,
+                        axis=0,
+                    )
+                )
+            del kspace_cc_echo
+            gc.collect()
+
+            kspace_calib = _build_bart_calibration_kspace(
+                mprage_data_file=mprage_data_file,
+                Nx=Nx,
+                Ny=Ny,
+                Nz=Nz,
+                os_factor=os_factor,
+                Nacs=nacs,
+                Wcc=Wcc,
+                logical_acs=logical_acs,
+            )
+            manifest_path = export_cartesian_inputs(
+                bart_folder,
+                cartesian_kspace=kspace_cc_logical.unsqueeze(3).numpy(),
+                coil_sens=None,
+                kspace_calib=kspace_calib,
+                coil_calibration={
+                    **READOUT_OVERSAMPLING_REMOVAL,
+                    "refscan_to_imaging_pe_index_transform": (
+                        REFSCAN_TO_IMAGING_PE_INDEX_TRANSFORM
+                    ),
+                    "bart_ecalib": {"maps": 1, "crop": float(espirit_crop)},
+                    "source_twix": str(Path(mprage_data_file).resolve()),
+                    "source_seq": str(Path(mprage_seq_file).resolve()),
+                    "oversampling_factor": int(os_factor),
+                    "input_readout": int(Nx * os_factor),
+                    "output_readout": int(Nx),
+                    "coil_compression": {"virtual_coils": int(ncc_requested)},
+                },
+            )
+            print(f"Saved BART Cartesian inputs: {manifest_path}")
+            _run_bart_cartesian_reconstruction(
+                bart_input_folder=bart_folder,
+                bart_output_folder=bart_output_folder,
+                twix_file=mprage_data_file,
+                seq_file=mprage_seq_file,
+                save_nifti=save_nifti,
+                save_nifti_phase=save_nifti_phase,
+                nifti_out_folder=nifti_out_folder,
+                nifti_sub=nifti_sub,
+                nifti_suffix=nifti_suffix,
+                nifti_axis_roles=nifti_axis_roles,
+                nifti_axis_flips=nifti_axis_flips,
+                twix_coord_system=twix_coord_system,
+                twix_inplane_rot_sign=twix_inplane_rot_sign,
+                twix_use_fov_for_voxel_size=twix_use_fov_for_voxel_size,
+                file_tag=file_tag,
+                yflip=yflip,
+                zflip=zflip,
+                espirit_crop=espirit_crop,
+                resume=resume,
+            )
+            print(f"Saved BART Cartesian reconstruction under: {bart_output_folder}")
+            return
+
         if csm_full_cc_np is None:
             raise RuntimeError("The SENSE backend requires SigPy sensitivity maps.")
         _check_csm_shape(csm_full_cc_np, Nx, Ny, Nz)
@@ -1037,6 +1148,7 @@ def load_or_generate_coil_sens(
     out_folder,
     file_tag,
     Nacs=32,
+    ncc=12,
     reuse_coil_calib=False,
     espirit_device="auto",
     espirit_gpu_index=0,
@@ -1044,9 +1156,33 @@ def load_or_generate_coil_sens(
     espirit_calib_mode="3d",
     espirit_cpu_workers=None,
 ):
-    """Load cached Wcc/CSM or generate them from the integrated ACS refscan set."""
-    csm_tag = _espirit_cache_tag(file_tag, espirit_calib_mode)
-    compression_tag = _coil_compression_cache_tag(file_tag)
+    """Load or generate coil compression and sensitivity maps.
+
+    Args:
+        mprage_data_file: Integrated Siemens TWIX input path.
+        Ny: Logical LIN matrix size.
+        Nz: Logical PAR matrix size.
+        os_factor: Readout oversampling factor.
+        out_folder: Output directory prefix.
+        file_tag: Optional cache suffix.
+        Nacs: Integrated ACS width.
+        ncc: Number of virtual coils to retain.
+        reuse_coil_calib: Reuse compatible cached arrays when available.
+        espirit_device: SigPy ESPIRiT device selection.
+        espirit_gpu_index: CUDA device index for GPU ESPIRiT.
+        espirit_crop: ESPIRiT eigenvalue crop threshold.
+        espirit_calib_mode: Native 3D or slice-wise 2D calibration mode.
+        espirit_cpu_workers: Optional slice-wise CPU worker count.
+
+    Returns:
+        Tuple of compression matrix, full sensitivity maps, and physical-coil
+        count.
+    """
+    ncc = int(ncc)
+    if ncc < 1:
+        raise ValueError("ncc must be a positive integer.")
+    csm_tag = _espirit_cache_tag(file_tag, espirit_calib_mode, ncc)
+    compression_tag = _coil_compression_cache_tag(file_tag, ncc)
     wcc_file = _npy_output_path(out_folder + 'coil_compression_energy_' + compression_tag)
     csm_file = _npy_output_path(out_folder + 'csm_full_' + csm_tag)
 
@@ -1063,6 +1199,16 @@ def load_or_generate_coil_sens(
         ref_data = load_ref(mprage_data_file)
         _check_integrated_refscan_shape(ref_data, Nacs=Nacs, Ncalib=None)
         Ncoil = int(ref_data.shape[-1])
+        if Wcc.shape != (Ncoil, ncc) or not np.isfinite(Wcc).all():
+            raise ValueError(
+                "Cached coil-compression matrix is incompatible with the "
+                f"current ACS: received {Wcc.shape}, expected {(Ncoil, ncc)}."
+            )
+        if csm_full_cc_np.shape[0] != ncc or not np.isfinite(csm_full_cc_np).all():
+            raise ValueError(
+                "Cached sensitivity maps are incompatible with the requested "
+                f"virtual-coil count {ncc}: received {csm_full_cc_np.shape}."
+            )
         return Wcc, csm_full_cc_np, Ncoil
 
     if reuse_coil_calib:
@@ -1076,6 +1222,7 @@ def load_or_generate_coil_sens(
         out_folder=out_folder,
         file_tag=file_tag,
         Nacs=Nacs,
+        ncc=ncc,
         espirit_device=espirit_device,
         espirit_gpu_index=espirit_gpu_index,
         espirit_crop=espirit_crop,
@@ -1091,10 +1238,27 @@ def load_or_generate_coil_compression_for_bart(
     out_folder,
     file_tag,
     Nacs=32,
+    ncc=12,
     reuse_coil_calib=False,
 ):
-    """Prepare only Wcc and logical ACS; BART ecalib estimates the maps."""
+    """Prepare a virtual-coil basis and logical ACS for BART ecalib.
 
+    Args:
+        mprage_data_file: Integrated Siemens TWIX input path.
+        os_factor: Readout oversampling factor.
+        out_folder: Output directory prefix.
+        file_tag: Optional cache suffix.
+        Nacs: Integrated ACS width.
+        ncc: Number of virtual coils to retain.
+        reuse_coil_calib: Reuse a compatible cached compression matrix.
+
+    Returns:
+        Tuple of compression matrix, logical ACS, and physical-coil count.
+    """
+
+    ncc = int(ncc)
+    if ncc < 1:
+        raise ValueError("ncc must be a positive integer.")
     data_ref = load_ref(mprage_data_file)
     _check_integrated_refscan_shape(data_ref, Nacs=Nacs, Ncalib=None)
     kspace_acs = data_ref[:, :Nacs, :Nacs, -1, :]
@@ -1102,13 +1266,12 @@ def load_or_generate_coil_compression_for_bart(
         kspace_acs, os_factor, axis=0
     ).contiguous()
     ncoil = int(logical_acs.shape[-1])
-    ncc = 12
     if ncc > ncoil:
         raise ValueError(
             f"Requested ncc={ncc}, but the TWIX refscan has only {ncoil} coils."
         )
 
-    compression_tag = _coil_compression_cache_tag(file_tag)
+    compression_tag = _coil_compression_cache_tag(file_tag, ncc)
     wcc_file = _npy_output_path(
         out_folder + "coil_compression_energy_" + compression_tag
     )
@@ -1150,20 +1313,44 @@ def generate_coil_sens(
     out_folder,
     file_tag,
     Nacs=32,
+    ncc=12,
     espirit_device="auto",
     espirit_gpu_index=0,
     espirit_crop=0.8,
     espirit_calib_mode="3d",
     espirit_cpu_workers=None,
 ):
-    """Generate Wcc and ESPIRiT CSMs from the integrated sequence ACS refscan."""
+    """Generate a requested virtual-coil basis and ESPIRiT sensitivity maps.
+
+    Args:
+        mprage_data_file: Integrated Siemens TWIX input path.
+        Ny: Logical LIN matrix size.
+        Nz: Logical PAR matrix size.
+        os_factor: Readout oversampling factor.
+        out_folder: Output directory prefix.
+        file_tag: Optional cache suffix.
+        Nacs: Integrated ACS width.
+        ncc: Number of virtual coils to retain.
+        espirit_device: SigPy ESPIRiT device selection.
+        espirit_gpu_index: CUDA device index for GPU ESPIRiT.
+        espirit_crop: ESPIRiT eigenvalue crop threshold.
+        espirit_calib_mode: Native 3D or slice-wise 2D calibration mode.
+        espirit_cpu_workers: Optional slice-wise CPU worker count.
+
+    Returns:
+        Tuple of compression matrix, full sensitivity maps, and physical-coil
+        count.
+    """
+    ncc = int(ncc)
+    if ncc < 1:
+        raise ValueError("ncc must be a positive integer.")
     espirit_crop = float(espirit_crop)
     if not np.isfinite(espirit_crop) or not 0.0 <= espirit_crop <= 1.0:
         raise ValueError("espirit_crop must be a finite value between 0 and 1.")
     espirit_calib_mode = str(espirit_calib_mode).strip().lower()
     if espirit_calib_mode not in ("3d", "slice2d"):
         raise ValueError("espirit_calib_mode must be '3d' or 'slice2d'.")
-    csm_tag = _espirit_cache_tag(file_tag, espirit_calib_mode)
+    csm_tag = _espirit_cache_tag(file_tag, espirit_calib_mode, ncc)
     print(f"ESPIRiT calibration mode: {espirit_calib_mode}")
 
     print(f"ESPIRiT crop threshold: {espirit_crop:g}")
@@ -1190,6 +1377,10 @@ def generate_coil_sens(
     _check_integrated_refscan_shape(data_ref, Nacs=Nacs, Ncalib=None)
     kspace_nowave_acs = data_ref[:, :Nacs, :Nacs, -1, :]
     Nx_os, Ny_acs, Nz_acs, Ncoil = kspace_nowave_acs.shape
+    if ncc > Ncoil:
+        raise ValueError(
+            f"Requested ncc={ncc}, but the TWIX refscan has only {Ncoil} coils."
+        )
     kspace_nowave_logical = remove_readout_oversampling_kspace(
         kspace_nowave_acs, os_factor, axis=0
     )
@@ -1204,12 +1395,12 @@ def generate_coil_sens(
     # Estimate compression on the same nominal-FOV ACS used by ESPIRiT.
     Wcc, cc_svals, cc_energy = estimate_cc_matrix_coillast(
         kspace_nowave_logical,
-        ncc=12,
+        ncc=ncc,
         acs=min(Ny_acs, Nz_acs),
         x_step=1,
     )
     print("Wcc:", Wcc.shape)
-    print("Energy retained by 12 coils:", cc_energy[11])
+    print(f"Energy retained by {ncc} coils:", cc_energy[ncc - 1])
 
     # For ESPIRiT, only make low-res CPU array first.
     # Convert to coil-first: (32, x, y, z)
@@ -1225,7 +1416,7 @@ def generate_coil_sens(
     low_shape = (kspace_nowave_np.shape[0], Nx, 32, 32)
     kspace_low_np = sp.resize(kspace_nowave_np, low_shape).astype(np.complex64, copy=False)
 
-    # Coil compression: 32 -> 12
+    # Apply the requested physical-to-virtual coil basis.
     kspace_low_cc_np = apply_cc_coilfirst_np(kspace_low_np, Wcc)
     print("kspace_low_cc_np:", kspace_low_cc_np.shape)
 
@@ -1312,7 +1503,7 @@ def generate_coil_sens(
     ).copy()
 
     # Version CSM caches so pre-fix RO processing and PE ordering are not reused.
-    compression_tag = _coil_compression_cache_tag(file_tag)
+    compression_tag = _coil_compression_cache_tag(file_tag, ncc)
     _save_npy(out_folder + 'coil_compression_energy_' + compression_tag, Wcc, 'coil compression matrix')
     _save_npy(out_folder + 'csm_acs_' + csm_tag, csm_low_cc_np, 'low-resolution ESPIRiT CSM')
     _save_npy(out_folder + 'csm_full_' + csm_tag, csm_full_cc_np, 'full-resolution ESPIRiT CSM')
@@ -2311,6 +2502,15 @@ def _parse_cli_args():
         default=None,
         help="Suffix tag used in output filenames.",
     )
+    parser.add_argument(
+        "--coil-compression-channels",
+        "--vcc-channels",
+        "--ncc",
+        dest="ncc",
+        type=int,
+        default=None,
+        help="Number of virtual coils retained after SVD coil compression. Default: 12.",
+    )
     parser.add_argument("--reuse-coil-calib", action="store_true",
                         help="Reuse the coil-compression matrix; the explicit SENSE backend also reuses its compatible CSM cache.")
     parser.add_argument(
@@ -2503,31 +2703,32 @@ def _npy_output_path(path_without_ext):
     return path_without_ext if path_without_ext.endswith(".npy") else path_without_ext + ".npy"
 
 
-def _espirit_cache_tag(file_tag, mode):
-    """Return a mode-, RO-, and PE-ordering-specific CSM cache tag."""
+def _espirit_cache_tag(file_tag, mode, ncc=12):
+    """Return a mode-, virtual-coil-, RO-, and PE-specific CSM cache tag."""
     mode = str(mode).strip().lower()
     file_tag = str(file_tag)
     if mode == "3d":
-        prefix = "pealign_roimgcrop"
+        prefix = f"ncc{int(ncc)}_pealign_roimgcrop"
         return prefix if file_tag == "" else prefix + "_" + file_tag
     if mode == "slice2d":
         # The SAG support guard, RO crop, and PE alignment affect CSM identity.
-        prefix = "slice2d_sagmask_pealign_roimgcrop"
+        prefix = f"ncc{int(ncc)}_slice2d_sagmask_pealign_roimgcrop"
         return prefix if file_tag == "" else prefix + "_" + file_tag
     raise ValueError("ESPIRiT calibration mode must be '3d' or 'slice2d'.")
 
 
-def _coil_compression_cache_tag(file_tag):
+def _coil_compression_cache_tag(file_tag, ncc=12):
     """Return a cache tag that rejects legacy stride-derived PCA bases.
 
     Args:
         file_tag: User-provided output suffix.
+        ncc: Number of virtual coils retained by the compression matrix.
 
     Returns:
         Cache tag containing the nominal-FOV image-crop processing identity.
     """
     file_tag = str(file_tag)
-    prefix = "roimgcrop"
+    prefix = f"ncc{int(ncc)}_roimgcrop"
     return prefix if file_tag == "" else prefix + "_" + file_tag
 
 
@@ -2621,6 +2822,88 @@ def _run_bart_reconstruction(
     subprocess.run(command, check=True)
 
 
+def _run_bart_cartesian_reconstruction(
+    *,
+    bart_input_folder,
+    bart_output_folder,
+    twix_file,
+    seq_file,
+    save_nifti,
+    save_nifti_phase,
+    nifti_out_folder,
+    nifti_sub,
+    nifti_suffix,
+    nifti_axis_roles,
+    nifti_axis_flips,
+    twix_coord_system,
+    twix_inplane_rot_sign,
+    twix_use_fov_for_voxel_size,
+    file_tag,
+    yflip,
+    zflip,
+    espirit_crop=0.8,
+    resume=True,
+):
+    """Run BART PICS for logical-grid no-wave Cartesian MPRAGE data."""
+
+    wrapper = Path(__file__).resolve().parent / "bart" / "run_cartesian_recon.sh"
+    command = [
+        "bash",
+        str(wrapper),
+        "--bart-input",
+        str(bart_input_folder),
+        "--bart-output",
+        str(bart_output_folder),
+        "--maps-source",
+        "bart",
+        "--twix",
+        str(twix_file),
+        "--seq",
+        str(seq_file),
+        "--ecalib-options",
+        "-c",
+        f"{float(espirit_crop):g}",
+        "--end-ecalib-options",
+    ]
+    if resume:
+        command.append("--resume")
+    if not save_nifti:
+        command.append("--skip-nifti")
+    else:
+        command.extend(["--nifti-output", str(nifti_out_folder)])
+        if save_nifti_phase:
+            command.append("--save-phase")
+        command.extend(
+            [
+                "--nifti-options",
+                "--file-tag",
+                str(file_tag),
+                "--nifti-suffix",
+                str(nifti_suffix),
+                "--nifti-axis-roles",
+                *[str(value) for value in nifti_axis_roles],
+                "--nifti-axis-flips",
+                *[str(bool(value)).lower() for value in nifti_axis_flips],
+                "--twix-coord-system",
+                str(twix_coord_system),
+                "--twix-inplane-rot-sign",
+                str(twix_inplane_rot_sign),
+                "--yflip",
+                str(yflip),
+                "--zflip",
+                str(zflip),
+            ]
+        )
+        if nifti_sub:
+            command.extend(["--nifti-sub", str(nifti_sub)])
+        if twix_use_fov_for_voxel_size:
+            command.append("--twix-use-fov-for-voxel-size")
+        command.append("--end-nifti-options")
+
+    print("Running BART Cartesian PICS reconstruction with GPU wavelet/FISTA...")
+    subprocess.run(command, check=True)
+
+
 def _collect_runtime_config():
     """Collect runtime paths/tags from CLI args, existing globals, or prompts."""
     cli = _parse_cli_args()
@@ -2682,15 +2965,15 @@ def _collect_runtime_config():
         or cli.save_bart_inputs
         or globals().get("save_bart_inputs", False)
     )
-    if save_bart_inputs_value and tag_wave_value != "wave":
-        if reconstruction_backend_value == "bart":
-            raise ValueError(
-                "The default BART backend requires a wave acquisition. Use "
-                "--reconstruction-backend sense for no-wave data."
-            )
+    if (
+        save_bart_inputs_value
+        and tag_wave_value != "wave"
+        and reconstruction_backend_value != "bart"
+    ):
         raise ValueError("--save-bart-inputs requires a wave acquisition.")
 
     reuse_coil_calib_value = bool(cli.reuse_coil_calib or globals().get("reuse_coil_calib", False))
+    ncc_value = _get_optional_int("ncc", cli.ncc, default=12)
     espirit_device_value = cli.espirit_device
     if espirit_device_value is None:
         espirit_device_value = globals().get("espirit_device", "auto")
@@ -2820,7 +3103,7 @@ def _collect_runtime_config():
     print(f"  backend:           {reconstruction_backend_value}")
     print(f"  resume:            {resume_value}")
     print(f"  reuse_coil_calib:  {reuse_coil_calib_value}")
-    print("  coil compression: CPU")
+    print(f"  coil compression: CPU, {ncc_value} virtual coils")
     if reconstruction_backend_value == "sense":
         print(f"  ESPIRiT request:  {espirit_device_value} (GPU index {espirit_gpu_index_value})")
         print(f"  ESPIRiT mode:     {espirit_calib_mode_value}")
@@ -2837,7 +3120,13 @@ def _collect_runtime_config():
     else:
         print("  sensitivity maps: BART ecalib (SigPy ESPIRiT skipped)")
         print(f"  BART ecalib crop: {espirit_crop_value:g}")
-        print("  BART solver:      GPU wavelet/FISTA (-w -f -g)")
+        if tag_wave_value == "wave":
+            print("  BART solver:      GPU wavelet/FISTA (bart wave -w -f -g)")
+        else:
+            print(
+                "  BART solver:      GPU Cartesian PICS "
+                "(-l1 -r 1e-5 --fista -i 300 -g -S)"
+            )
     print(f"  yflip/zflip:       {yflip_value}/{zflip_value}")
     print(f"  save_nifti:        {save_nifti_value}")
     print(f"  save_bart_inputs:  {save_bart_inputs_value}")
@@ -2860,6 +3149,7 @@ def _collect_runtime_config():
         "reconstruction_backend": reconstruction_backend_value,
         "resume": resume_value,
         "reuse_coil_calib": reuse_coil_calib_value,
+        "ncc": ncc_value,
         "espirit_device": espirit_device_value,
         "espirit_gpu_index": espirit_gpu_index_value,
         "espirit_crop": espirit_crop_value,
