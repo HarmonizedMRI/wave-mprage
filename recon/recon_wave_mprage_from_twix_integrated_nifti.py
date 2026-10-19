@@ -557,6 +557,7 @@ def main():
                 save_phase=save_nifti_phase,
                 twix_array_axis_roles=nifti_axis_roles,
                 twix_array_axis_flips=nifti_axis_flips,
+                twix_affine_axis_flips=RECON_NIFTI_AFFINE_AXIS_FLIPS,
                 twix_coord_system=twix_coord_system,
                 twix_inplane_rot_sign=twix_inplane_rot_sign,
                 twix_use_fov_for_voxel_size=twix_use_fov_for_voxel_size,
@@ -738,6 +739,7 @@ def main():
                 save_phase=save_nifti_phase,
                 twix_array_axis_roles=nifti_axis_roles,
                 twix_array_axis_flips=nifti_axis_flips,
+                twix_affine_axis_flips=RECON_NIFTI_AFFINE_AXIS_FLIPS,
                 twix_coord_system=twix_coord_system,
                 twix_inplane_rot_sign=twix_inplane_rot_sign,
                 twix_use_fov_for_voxel_size=twix_use_fov_for_voxel_size,
@@ -764,6 +766,14 @@ def main():
 # -----------------------------------------------------------------------------
 # MPRAGE NIfTI export
 # -----------------------------------------------------------------------------
+
+# Native CG-SENSE and BART reconstructions store images in the same logical
+# (RO, LIN, PAR) orientation: native and BART PICS NIfTIs of one 2026-10-13
+# no-wave scan agree (correlation 0.988). Native exports therefore use the BART
+# converter's affine flips (bart/wave_to_nifti.py, BART_AFFINE_AXIS_FLIPS). The
+# writer default below stays (True, False, True) for external callers that
+# compensate for it with their own array flips.
+RECON_NIFTI_AFFINE_AXIS_FLIPS = (False, False, False)
 
 
 def save_mprage_output_to_nifti(

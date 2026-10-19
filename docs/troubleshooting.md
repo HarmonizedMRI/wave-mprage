@@ -536,6 +536,8 @@ Compare against a trusted DICOM/NIfTI reference and adjust:
 
 The current MPRAGE defaults are axis roles `phase,readout,slice`, axis flips `true,false,false`, rotation sign `-1`, and `LPS`.
 
+A BART NIfTI that is upside down and mirrored left-right, and whose sidecar records `NIfTIAffineAxisFlips` `[true, false, true]`, was written by the converter before its orientation fix. Reconvert it with `bart/wave_to_nifti.py` (or `run_wave_recon.sh --resume`) instead of reorienting the file.
+
 ## MATLAB cannot find Pulseq
 
 Provide either the Pulseq repository root or its `matlab/` directory when prompted. The path helper must be able to find the `+mr` package.

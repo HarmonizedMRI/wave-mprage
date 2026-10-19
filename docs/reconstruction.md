@@ -589,6 +589,19 @@ Twix coordinate mode: LPS
 in-plane rotation:    sign -1.0
 ```
 
+BART images are converted by `bart/wave_to_nifti.py`, which passes
+`BART_AFFINE_AXIS_FLIPS = (False, False, False)` instead of the writer's default
+affine flips `(True, False, True)`. After the physical array flips
+`true,false,false`, the TWIX header directions already describe the BART image
+axes: for the sagittal protocol, RO points superior, LIN anterior and PAR along
+the slice normal. The sidecars record both flip sets
+(`NIfTIPhysicalArrayFlipsApplied`, `NIfTIAffineAxisFlips`). Native CG-SENSE
+exports store images in the same orientation and pass the same flips
+(`RECON_NIFTI_AFFINE_AXIS_FLIPS`). The writer default is unchanged for external
+callers that compensate for it. NIfTIs written before this change record
+`NIfTIAffineAxisFlips` `[true, false, true]` and are rotated by 180 degrees
+about the A-P axis.
+
 Relevant options include:
 
 ```text

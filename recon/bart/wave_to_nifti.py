@@ -17,6 +17,17 @@ if str(RECON_ROOT) not in sys.path:
 
 from bart.bart_utils.bart_io import read_cfl
 
+# BART images keep the exported k-space index order. For sagittal Wave-MPRAGE,
+# logical RO increases toward superior, LIN toward anterior and PAR along the
+# TWIX slice normal, so after the physical array flips (True, False, False)
+# the unflipped TWIX header directions describe the stored axes. The writer's
+# default affine flips (True, False, True) would rotate BART images by 180
+# degrees about the A-P axis (S-I and L-R inverted). Product-DICOM comparison
+# of BART Wave-MPRAGE output (pulseq_wave_calibration cad8191, 2026-08-31)
+# established this convention; the in vivo anatomy of the 2026-10-15 Prisma
+# and 2026-10-16 Terra.X scans confirms its S-I and A-P directions.
+BART_AFFINE_AXIS_FLIPS = (False, False, False)
+
 
 def _parse_bool(value: str | bool) -> bool:
     if isinstance(value, bool):
@@ -204,6 +215,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "BARTKspaceInput": entry["kspace"].name,
             "BARTInternalNormalizationRestored": True,
             "BARTOutputAlreadyReadoutDeoversampled": True,
+            "NIfTIBARTOrientationCorrection": (
+                "unflipped TWIX directions after the physical array flips; the "
+                "writer's default affine flips (True, False, True) inverted "
+                "S-I and L-R of BART images"
+            ),
         }
     )
     if tag_wave == "wave":
@@ -234,6 +250,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         save_phase=bool(args.save_phase),
         twix_array_axis_roles=tuple(args.nifti_axis_roles),
         twix_array_axis_flips=tuple(args.nifti_axis_flips),
+        twix_affine_axis_flips=BART_AFFINE_AXIS_FLIPS,
         twix_coord_system=args.twix_coord_system,
         twix_inplane_rot_sign=float(args.twix_inplane_rot_sign),
         twix_use_fov_for_voxel_size=bool(args.twix_use_fov_for_voxel_size),
