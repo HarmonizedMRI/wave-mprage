@@ -64,6 +64,10 @@ from bart.bart_utils.bart_io import (
     export_wave_inputs,
 )
 from utils.espirit_calibration import estimate_espirit_maps
+from utils.noise_prewhitening import (
+    prepare_noise_prewhitener,
+    prewhitening_provenance,
+)
 
 from utils.psf_wrapped_phase_fit import fit_wrapped_phase_planes
 from utils.psf_wrapped_phase_fit import smooth_1d_nan
@@ -121,17 +125,18 @@ def _current_psf_composition_provenance():
     }
 
 
-def _bart_coil_calibration_provenance(espirit_crop, ncc):
+def _bart_coil_calibration_provenance(espirit_crop, ncc, prewhiten=False):
     """Return the BART sensitivity-estimation identity used for safe resume.
 
     Args:
         espirit_crop: BART ecalib eigenvalue crop threshold.
         ncc: Number of virtual coils retained after coil compression.
+        prewhiten: Whether embedded-noise prewhitening precedes compression.
 
     Returns:
         Manifest fields identifying PE alignment and BART map calibration.
     """
-    return {
+    provenance = {
         "refscan_to_imaging_pe_index_transform": (
             REFSCAN_TO_IMAGING_PE_INDEX_TRANSFORM
         ),
@@ -141,6 +146,9 @@ def _bart_coil_calibration_provenance(espirit_crop, ncc):
         },
         "coil_compression": _coil_compression_provenance(ncc),
     }
+    if prewhiten:
+        provenance["noise_prewhitening"] = prewhitening_provenance(True)
+    return provenance
 
 
 def main():
@@ -176,6 +184,8 @@ def main():
     save_bart_inputs = cfg["save_bart_inputs"]
     reconstruction_backend = cfg["reconstruction_backend"]
     resume = cfg["resume"]
+    prewhiten = cfg["prewhiten"]
+    wavelet_regularization = cfg["wavelet_regularization"]
 
     seq = pp.Sequence()
     seq.read(mprage_seq_file, remove_duplicates=False)
@@ -228,18 +238,27 @@ def main():
     bart_inputs_current = False
     if resume and reconstruction_backend == "bart":
         if tag_wave == "wave":
-            bart_resume_current = bart_reconstruction_is_current(
-                bart_folder,
-                bart_output_folder,
-                source_twix=mprage_data_file,
-                source_seq=mprage_seq_file,
-                expected_psf_composition=_current_psf_composition_provenance(),
-                expected_coil_calibration=_bart_coil_calibration_provenance(
-                    espirit_crop, ncc_requested
-                ),
-                allow_legacy_provenance=(
-                    np.isclose(espirit_crop, 0.8) and ncc_requested == 12
-                ),
+            bart_resume_current = (
+                wavelet_regularization is None
+                and bart_reconstruction_is_current(
+                    bart_folder,
+                    bart_output_folder,
+                    source_twix=mprage_data_file,
+                    source_seq=mprage_seq_file,
+                    expected_psf_composition=(
+                        _current_psf_composition_provenance()
+                    ),
+                    expected_coil_calibration=(
+                        _bart_coil_calibration_provenance(
+                            espirit_crop, ncc_requested, prewhiten
+                        )
+                    ),
+                    allow_legacy_provenance=(
+                        np.isclose(espirit_crop, 0.8)
+                        and ncc_requested == 12
+                        and not prewhiten
+                    ),
+                )
             )
             if not bart_resume_current:
                 bart_inputs_current = bart_reconstruction_inputs_are_current(
@@ -248,20 +267,23 @@ def main():
                     source_seq=mprage_seq_file,
                     expected_psf_composition=_current_psf_composition_provenance(),
                     expected_coil_calibration=_bart_coil_calibration_provenance(
-                        espirit_crop, ncc_requested
+                        espirit_crop, ncc_requested, prewhiten
                     ),
                     allow_legacy_provenance=False,
                 )
         else:
-            bart_resume_current = bart_cartesian_reconstruction_is_current(
-                bart_folder,
-                bart_output_folder,
-                source_twix=mprage_data_file,
-                source_seq=mprage_seq_file,
-                expected_coil_calibration=_bart_coil_calibration_provenance(
-                    espirit_crop, ncc_requested
-                ),
-                allow_legacy_provenance=False,
+            bart_resume_current = (
+                wavelet_regularization is None
+                and bart_cartesian_reconstruction_is_current(
+                    bart_folder,
+                    bart_output_folder,
+                    source_twix=mprage_data_file,
+                    source_seq=mprage_seq_file,
+                    expected_coil_calibration=_bart_coil_calibration_provenance(
+                        espirit_crop, ncc_requested, prewhiten
+                    ),
+                    allow_legacy_provenance=False,
+                )
             )
             if not bart_resume_current:
                 bart_inputs_current = bart_cartesian_inputs_are_current(
@@ -269,7 +291,7 @@ def main():
                     source_twix=mprage_data_file,
                     source_seq=mprage_seq_file,
                     expected_coil_calibration=_bart_coil_calibration_provenance(
-                        espirit_crop, ncc_requested
+                        espirit_crop, ncc_requested, prewhiten
                     ),
                     allow_legacy_provenance=False,
                 )
@@ -309,6 +331,7 @@ def main():
             zflip=zflip,
             espirit_crop=espirit_crop,
             resume=resume,
+            wavelet_regularization=wavelet_regularization,
         )
         if bart_resume_current:
             print("Resume completed without rerunning BART reconstruction.")
@@ -316,6 +339,11 @@ def main():
             print("Interrupted BART reconstruction resumed from current inputs.")
         return
 
+    noise_whitener, noise_diagnostics = _prepare_optional_noise_prewhitening(
+        mprage_data_file=mprage_data_file,
+        out_folder=out_folder,
+        enabled=prewhiten,
+    )
     logical_acs = None
     if reconstruction_backend == "bart":
         print("Preparing coil compression for BART; skipping SigPy ESPIRiT...")
@@ -327,6 +355,7 @@ def main():
             Nacs=nacs,
             ncc=ncc_requested,
             reuse_coil_calib=reuse_coil_calib,
+            noise_whitener=noise_whitener,
         )
         csm_full_cc_np = None
     else:
@@ -406,6 +435,7 @@ def main():
             coefficient_processing=psf_coefficient_processing,
             fit_kx_min=psf_fit_kx_min,
             fit_kx_max=psf_fit_kx_max,
+            noise_whitener=noise_whitener,
             return_diagnostics=True,
         )
         resolved_psf_fit_kx_range = psf_processing_diagnostics.get("kx_range")
@@ -447,6 +477,8 @@ def main():
                     "coil_compression": _coil_compression_provenance(
                         ncc_requested
                     ),
+                    "noise_prewhitening": prewhitening_provenance(prewhiten),
+                    "noise_prewhitening_diagnostics": noise_diagnostics,
                 },
             )
             print(f"Saved BART Wave-CAIPI inputs: {manifest_path}")
@@ -472,6 +504,7 @@ def main():
                     zflip=zflip,
                     espirit_crop=espirit_crop,
                     resume=resume,
+                    wavelet_regularization=wavelet_regularization,
                 )
                 print(f"Saved BART Wave-CAIPI reconstruction under: {bart_output_folder}")
                 return
@@ -598,6 +631,8 @@ def main():
                     "coil_compression": _coil_compression_provenance(
                         ncc_requested
                     ),
+                    "noise_prewhitening": prewhitening_provenance(prewhiten),
+                    "noise_prewhitening_diagnostics": noise_diagnostics,
                 },
             )
             print(f"Saved BART Cartesian inputs: {manifest_path}")
@@ -621,6 +656,7 @@ def main():
                 zflip=zflip,
                 espirit_crop=espirit_crop,
                 resume=resume,
+                wavelet_regularization=wavelet_regularization,
             )
             print(f"Saved BART Cartesian reconstruction under: {bart_output_folder}")
             return
@@ -1277,6 +1313,46 @@ def load_or_generate_coil_sens(
     )
 
 
+def _prepare_optional_noise_prewhitening(
+    *, mprage_data_file, out_folder, enabled
+):
+    """Prepare and record an optional physical-coil noise whitener.
+
+    Args:
+        mprage_data_file: Integrated Siemens TWIX source with embedded noise.
+        out_folder: Reconstruction output directory.
+        enabled: Whether embedded-noise prewhitening was requested.
+
+    Returns:
+        Optional physical-coil whitener and JSON-compatible diagnostics.
+
+    Side Effects:
+        When enabled, writes covariance, whitener, eigenvalues, and a JSON
+        report under ``diagnostics/noise_prewhitening``.
+    """
+
+    if not enabled:
+        return None, prewhitening_provenance(False)
+    print("Estimating receive-noise prewhitening from embedded TWIX noise scan...")
+    covariance, whitener, eigenvalues, diagnostics = prepare_noise_prewhitener(
+        mprage_data_file
+    )
+    destination = Path(out_folder) / "diagnostics" / "noise_prewhitening"
+    destination.mkdir(parents=True, exist_ok=True)
+    np.save(destination / "noise_covariance_physical_coils.npy", covariance)
+    np.save(destination / "noise_whitener_physical_coils.npy", whitener)
+    np.save(destination / "noise_covariance_eigenvalues.npy", eigenvalues)
+    (destination / "report.json").write_text(
+        json.dumps(diagnostics, indent=2) + "\n", encoding="utf-8"
+    )
+    print(
+        "Noise prewhitening ready: "
+        f"{diagnostics['physical_coils']} coils, "
+        f"identity error={diagnostics['whitener_identity_error']:.3e}."
+    )
+    return whitener, diagnostics
+
+
 def load_or_generate_coil_compression_for_bart(
     *,
     mprage_data_file,
@@ -1286,6 +1362,7 @@ def load_or_generate_coil_compression_for_bart(
     Nacs=32,
     ncc=12,
     reuse_coil_calib=False,
+    noise_whitener=None,
 ):
     """Prepare a virtual-coil basis and logical ACS for BART ecalib.
 
@@ -1297,6 +1374,7 @@ def load_or_generate_coil_compression_for_bart(
         Nacs: Integrated ACS width.
         ncc: Number of virtual coils to retain.
         reuse_coil_calib: Reuse a compatible cached compression matrix.
+        noise_whitener: Optional physical-coil row-data prewhitening matrix.
 
     Returns:
         Tuple of compression matrix, logical ACS, and physical-coil count.
@@ -1317,11 +1395,24 @@ def load_or_generate_coil_compression_for_bart(
     ncoil = int(logical_acs.shape[-1])
     effective_ncc = _resolve_virtual_coil_count(ncc, ncoil)
 
-    compression_tag = _coil_compression_cache_tag(file_tag, ncc)
+    prewhiten = noise_whitener is not None
+    receiver_transform = (
+        _identity_coil_basis(ncoil)
+        if noise_whitener is None
+        else np.asarray(noise_whitener, dtype=np.complex64)
+    )
+    if receiver_transform.shape != (ncoil, ncoil):
+        raise ValueError(
+            "Noise whitener does not match the logical ACS channels: "
+            f"received {receiver_transform.shape}, expected {(ncoil, ncoil)}."
+        )
+    compression_tag = _coil_compression_cache_tag(
+        file_tag, ncc, prewhiten=prewhiten
+    )
     wcc_file = _npy_output_path(
         out_folder + "coil_compression_energy_" + compression_tag
     )
-    if reuse_coil_calib and os.path.isfile(wcc_file):
+    if reuse_coil_calib and os.path.isfile(wcc_file) and not prewhiten:
         print(f"Loading cached coil compression matrix: {wcc_file}")
         Wcc = np.load(wcc_file, allow_pickle=False)
         if Wcc.shape != (ncoil, effective_ncc) or not np.isfinite(Wcc).all():
@@ -1332,22 +1423,34 @@ def load_or_generate_coil_compression_for_bart(
             )
     else:
         if reuse_coil_calib:
-            print("No compatible Wcc cache found; recomputing from logical ACS.")
+            if prewhiten:
+                print(
+                    "Recomputing the prewhitened Wcc basis to bind it to the "
+                    "current embedded noise scan."
+                )
+            else:
+                print("No compatible Wcc cache found; recomputing from logical ACS.")
+        estimation_acs = apply_cc_coillast_torch(
+            logical_acs, receiver_transform, x_chunk=8
+        )
         if ncc == 0:
-            Wcc = _identity_coil_basis(ncoil)
+            compression = _identity_coil_basis(ncoil)
             print(f"Coil compression disabled: retaining all {ncoil} channels.")
         else:
-            Wcc, _, cc_energy = estimate_cc_matrix_coillast(
-                logical_acs,
+            compression, _, cc_energy = estimate_cc_matrix_coillast(
+                estimation_acs,
                 ncc=effective_ncc,
-                acs=min(int(logical_acs.shape[1]), int(logical_acs.shape[2])),
+                acs=min(
+                    int(estimation_acs.shape[1]), int(estimation_acs.shape[2])
+                ),
                 x_step=1,
             )
             print(
                 f"Energy retained by {effective_ncc} coils: "
                 f"{float(cc_energy[effective_ncc - 1]):.6f}"
             )
-        print(f"Coil-compression matrix: {Wcc.shape}")
+        Wcc = receiver_transform @ np.asarray(compression, dtype=np.complex64)
+        print(f"Physical-to-output coil basis: {Wcc.shape}")
         _save_npy(
             out_folder + "coil_compression_energy_" + compression_tag,
             Wcc,
@@ -1780,7 +1883,8 @@ def _projection_fit_quality_summary(result):
 
 def fit_wave_psf_deviation_from_projection(mprage_data_file, mprage_seq_file, out_folder, file_tag,
                                            yflip=1, zflip=1, Ncalib=72, Nacs=32,
-                                           slice_orientation='SAG', return_diagnostics=False):
+                                           slice_orientation='SAG', noise_whitener=None,
+                                           return_diagnostics=False):
     """Fit PSF deviation from integrated refscan projection calibration blocks.
 
     Args:
@@ -1794,6 +1898,8 @@ def fit_wave_psf_deviation_from_projection(mprage_data_file, mprage_seq_file, ou
         Ncalib: Projection-calibration line count.
         Nacs: Integrated ACS width.
         slice_orientation: Supported sequence orientation.
+        noise_whitener: Optional physical-coil prewhitening matrix applied to
+            each projection pair before phase fitting.
         return_diagnostics: Return structured projection quality in addition
             to the backward-compatible coefficient tuple.
 
@@ -1812,6 +1918,15 @@ def fit_wave_psf_deviation_from_projection(mprage_data_file, mprage_seq_file, ou
             load_ref_set(mprage_data_file, 3, lin_count=1, par_count=Ncalib),
         ),
     }
+    if noise_whitener is not None:
+        receiver_transform = np.asarray(noise_whitener, dtype=np.complex64)
+        projection_ref = {
+            axis: tuple(
+                apply_cc_coillast_torch(array, receiver_transform, x_chunk=8)
+                for array in pair
+            )
+            for axis, pair in projection_ref.items()
+        }
     Nx_os = int(projection_ref["sin"][0].shape[0])
     Ncoil = int(projection_ref["sin"][0].shape[-1])
     expected_projection_shapes = {
@@ -2260,7 +2375,7 @@ def generate_calibrated_psf(mprage_data_file, mprage_seq_file, out_folder, Nx_os
                             yflip=-1, zflip=-1, Ncalib=72, Nacs=32,
                             slice_orientation='SAG', psf_plot=True,
                             coefficient_processing='smooth', fit_kx_min=None, fit_kx_max=None,
-                            return_diagnostics=False):
+                            noise_whitener=None, return_diagnostics=False):
     """Generate a calibrated Wave PSF from the integrated calibration module.
 
     Args:
@@ -2281,6 +2396,8 @@ def generate_calibrated_psf(mprage_data_file, mprage_seq_file, out_folder, Nx_os
         coefficient_processing: ``smooth`` or ``sine-line``.
         fit_kx_min: Optional inclusive manual sine-line range start.
         fit_kx_max: Optional exclusive manual sine-line range stop.
+        noise_whitener: Optional physical-coil prewhitening matrix used by the
+            projection-deviation calibration.
         return_diagnostics: Append coefficient-processing diagnostics.
 
     Returns:
@@ -2304,6 +2421,7 @@ def generate_calibrated_psf(mprage_data_file, mprage_seq_file, out_folder, Nx_os
         Ncalib=Ncalib,
         Nacs=Nacs,
         slice_orientation=slice_orientation,
+        noise_whitener=noise_whitener,
         return_diagnostics=True,
     )
 
@@ -2579,6 +2697,24 @@ def _parse_cli_args():
         help="Force TWIX preprocessing and BART reconstruction to run again.",
     )
     parser.set_defaults(resume=True)
+    prewhitening_group = parser.add_mutually_exclusive_group()
+    prewhitening_group.add_argument(
+        "--prewhiten",
+        "--noise-prewhitening",
+        dest="prewhiten",
+        action="store_true",
+        help=(
+            "Estimate receive-noise covariance from the embedded TWIX noise "
+            "scan and prewhiten physical coils before compression."
+        ),
+    )
+    prewhitening_group.add_argument(
+        "--no-prewhiten",
+        dest="prewhiten",
+        action="store_false",
+        help="Disable receive-noise prewhitening (default).",
+    )
+    parser.set_defaults(prewhiten=False)
 
     parser.add_argument(
         "--file-tag",
@@ -2604,6 +2740,17 @@ def _parse_cli_args():
     )
     parser.add_argument("--reuse-coil-calib", action="store_true",
                         help="Reuse the coil-compression matrix; the explicit SENSE backend also reuses its compatible CSM cache.")
+    parser.add_argument(
+        "--wavelet-regularization",
+        "--wavelet-lambda",
+        type=float,
+        default=None,
+        metavar="LAMBDA",
+        help=(
+            "BART wavelet/L1 regularization weight. Passes LAMBDA to bart "
+            "wave -r for wave data or bart pics -r for no-wave data."
+        ),
+    )
     parser.add_argument(
         "--espirit-device",
         choices=("auto", "cpu", "gpu"),
@@ -2866,18 +3013,20 @@ def _espirit_cache_tag(file_tag, mode, ncc=12):
     raise ValueError("ESPIRiT calibration mode must be '3d' or 'slice2d'.")
 
 
-def _coil_compression_cache_tag(file_tag, ncc=12):
+def _coil_compression_cache_tag(file_tag, ncc=12, prewhiten=False):
     """Return a cache tag that rejects legacy stride-derived PCA bases.
 
     Args:
         file_tag: User-provided output suffix.
         ncc: Number of virtual coils retained by the compression matrix.
+        prewhiten: Whether the matrix includes embedded-noise prewhitening.
 
     Returns:
         Cache tag containing the nominal-FOV image-crop processing identity.
     """
     file_tag = str(file_tag)
-    prefix = f"ncc{_ncc_cache_label(ncc)}_roimgcrop"
+    noise_tag = "_prewhiten-v1" if prewhiten else ""
+    prefix = f"ncc{_ncc_cache_label(ncc)}{noise_tag}_roimgcrop"
     return prefix if file_tag == "" else prefix + "_" + file_tag
 
 
@@ -2910,8 +3059,38 @@ def _run_bart_reconstruction(
     zflip,
     espirit_crop=0.8,
     resume=True,
+    wavelet_regularization=None,
 ):
-    """Run the repository BART wrapper with its GPU wavelet/FISTA defaults."""
+    """Run the BART wrapper with optional wavelet regularization.
+
+    Args:
+        bart_input_folder: Directory containing BART Wave input CFL pairs.
+        bart_output_folder: Directory receiving BART maps and images.
+        twix_file: Source TWIX path used by NIfTI conversion.
+        seq_file: Source Pulseq path used by NIfTI conversion.
+        save_nifti: Whether to convert reconstructed images to NIfTI.
+        save_nifti_phase: Whether to save phase NIfTI alongside magnitude.
+        nifti_out_folder: NIfTI output directory.
+        nifti_sub: Optional NIfTI subject basename.
+        nifti_suffix: NIfTI filename suffix.
+        nifti_axis_roles: Logical-to-physical array-axis roles.
+        nifti_axis_flips: Boolean array-axis flips.
+        twix_coord_system: TWIX patient coordinate convention.
+        twix_inplane_rot_sign: Sign applied to TWIX in-plane rotation.
+        twix_use_fov_for_voxel_size: Derive voxel size from TWIX FOV.
+        file_tag: Optional reconstruction filename tag.
+        yflip: LIN PSF calibration sign.
+        zflip: PAR PSF calibration sign.
+        espirit_crop: BART ecalib eigenvalue crop threshold.
+        resume: Reuse current BART artifacts when possible.
+        wavelet_regularization: Optional BART ``wave -r`` value.
+
+    Returns:
+        None.
+
+    Side Effects:
+        Runs the repository BART shell wrapper as a checked subprocess.
+    """
 
     wrapper = Path(__file__).resolve().parent / "bart" / "run_wave_recon.sh"
     command = [
@@ -2932,8 +3111,20 @@ def _run_bart_reconstruction(
         f"{float(espirit_crop):g}",
         "--end-ecalib-options",
     ]
-    if resume:
+    if resume and wavelet_regularization is None:
         command.append("--resume")
+    if wavelet_regularization is not None:
+        command.extend(
+            [
+                "--wave-options",
+                "-w",
+                "-r",
+                f"{float(wavelet_regularization):g}",
+                "-f",
+                "-g",
+                "--end-wave-options",
+            ]
+        )
     if not save_nifti:
         command.append("--skip-nifti")
     else:
@@ -2967,7 +3158,16 @@ def _run_bart_reconstruction(
             command.append("--twix-use-fov-for-voxel-size")
         command.append("--end-nifti-options")
 
-    print("Running BART Wave-CAIPI reconstruction with default GPU wavelet/FISTA...")
+    if wavelet_regularization is None:
+        print(
+            "Running BART Wave-CAIPI reconstruction with default GPU "
+            "wavelet/FISTA..."
+        )
+    else:
+        print(
+            "Running BART Wave-CAIPI reconstruction with GPU wavelet/FISTA "
+            f"and regularization={float(wavelet_regularization):g}..."
+        )
     subprocess.run(command, check=True)
 
 
@@ -2992,8 +3192,14 @@ def _run_bart_cartesian_reconstruction(
     zflip,
     espirit_crop=0.8,
     resume=True,
+    wavelet_regularization=None,
 ):
-    """Run BART PICS for logical-grid no-wave Cartesian MPRAGE data."""
+    """Run BART PICS for logical-grid no-wave Cartesian MPRAGE data.
+
+    Args:
+        wavelet_regularization: Optional PICS L1 regularization weight. When
+            omitted, the wrapper retains its historical default of ``1e-5``.
+    """
 
     wrapper = Path(__file__).resolve().parent / "bart" / "run_cartesian_recon.sh"
     command = [
@@ -3014,8 +3220,23 @@ def _run_bart_cartesian_reconstruction(
         f"{float(espirit_crop):g}",
         "--end-ecalib-options",
     ]
-    if resume:
+    if resume and wavelet_regularization is None:
         command.append("--resume")
+    if wavelet_regularization is not None:
+        command.extend(
+            [
+                "--pics-options",
+                "-l1",
+                "-r",
+                f"{float(wavelet_regularization):g}",
+                "--fista",
+                "-i",
+                "300",
+                "-g",
+                "-S",
+                "--end-pics-options",
+            ]
+        )
     if not save_nifti:
         command.append("--skip-nifti")
     else:
@@ -3049,7 +3270,13 @@ def _run_bart_cartesian_reconstruction(
             command.append("--twix-use-fov-for-voxel-size")
         command.append("--end-nifti-options")
 
-    print("Running BART Cartesian PICS reconstruction with GPU wavelet/FISTA...")
+    if wavelet_regularization is None:
+        print("Running BART Cartesian PICS reconstruction with GPU wavelet/FISTA...")
+    else:
+        print(
+            "Running BART Cartesian PICS reconstruction with GPU wavelet/FISTA "
+            f"and regularization={float(wavelet_regularization):g}..."
+        )
     subprocess.run(command, check=True)
 
 
@@ -3109,6 +3336,21 @@ def _collect_runtime_config():
     )
     reconstruction_backend_value = str(cli.reconstruction_backend).strip().lower()
     resume_value = bool(cli.resume)
+    prewhiten_value = bool(cli.prewhiten)
+    if prewhiten_value and reconstruction_backend_value != "bart":
+        raise ValueError(
+            "--prewhiten currently requires --reconstruction-backend bart."
+        )
+    wavelet_regularization_value = cli.wavelet_regularization
+    if wavelet_regularization_value is not None:
+        wavelet_regularization_value = float(wavelet_regularization_value)
+        if (
+            not np.isfinite(wavelet_regularization_value)
+            or wavelet_regularization_value < 0
+        ):
+            raise ValueError(
+                "--wavelet-regularization must be finite and nonnegative."
+            )
     save_bart_inputs_value = bool(
         reconstruction_backend_value == "bart"
         or cli.save_bart_inputs
@@ -3277,11 +3519,24 @@ def _collect_runtime_config():
         print("  sensitivity maps: BART ecalib (SigPy ESPIRiT skipped)")
         print(f"  BART ecalib crop: {espirit_crop_value:g}")
         if tag_wave_value == "wave":
-            print("  BART solver:      GPU wavelet/FISTA (bart wave -w -f -g)")
+            regularization = (
+                "default"
+                if wavelet_regularization_value is None
+                else f"{wavelet_regularization_value:g}"
+            )
+            print(
+                "  BART solver:      GPU wavelet/FISTA "
+                f"(bart wave, regularization={regularization})"
+            )
         else:
+            regularization = (
+                "1e-5 (default)"
+                if wavelet_regularization_value is None
+                else f"{wavelet_regularization_value:g}"
+            )
             print(
                 "  BART solver:      GPU Cartesian PICS "
-                "(-l1 -r 1e-5 --fista -i 300 -g -S)"
+                f"(-l1, regularization={regularization}, --fista -i 300 -g -S)"
             )
     print(f"  yflip/zflip:       {yflip_value}/{zflip_value}")
     print(f"  save_nifti:        {save_nifti_value}")
@@ -3304,6 +3559,8 @@ def _collect_runtime_config():
         "tag_wave": tag_wave_value,
         "reconstruction_backend": reconstruction_backend_value,
         "resume": resume_value,
+        "prewhiten": prewhiten_value,
+        "wavelet_regularization": wavelet_regularization_value,
         "reuse_coil_calib": reuse_coil_calib_value,
         "ncc": ncc_value,
         "espirit_device": espirit_device_value,

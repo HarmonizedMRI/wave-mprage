@@ -345,6 +345,34 @@ The no-VCC mode uses an identity physical-to-virtual basis and `nccall` cache
 names. It can require much more CPU/GPU memory, especially during BART `ecalib`
 and Wave reconstruction.
 
+### Optional noise prewhitening
+
+```text
+--prewhiten             estimate covariance from the embedded TWIX noise scan
+--no-prewhiten          retain the historical unwhitened model; default
+```
+
+Prewhitening is applied before VCC to the integrated ACS, image data, and PSF
+projection calibration. The physical-coil whitener and PCA compression are
+combined into one streaming basis. Covariance, whitener, eigenvalues, and
+validation diagnostics are saved under
+`<out>/diagnostics/noise_prewhitening`. Manifest and cache identities prevent
+prewhitened inputs from being resumed as unwhitened inputs or vice versa.
+
+### Integrated BART wavelet regularization
+
+```text
+--wavelet-regularization FLOAT
+--wavelet-lambda FLOAT              compatibility alias
+```
+
+For wave acquisitions, the integrated command passes a supplied value to BART
+as `wave -w -r FLOAT -f -g`. For no-wave Cartesian acquisitions, it passes the
+same value as `pics -l1 -r FLOAT --fista -i 300 -g -S`. With no value, each
+wrapper retains its historical default. A custom value reuses validated BART
+inputs but deliberately reruns BART outputs because older output manifests do
+not record the solver weight.
+
 ### ESPIRiT crop threshold
 
 ```text

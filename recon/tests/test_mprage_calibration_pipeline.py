@@ -59,6 +59,19 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
         with mock.patch.object(sys, "argv", base + ["--no-resume"]):
             self.assertFalse(reconstruction._parse_cli_args().resume)
 
+    def test_prewhitening_cli_and_resume_identity_are_explicit(self) -> None:
+        """Prewhitening should be opt-in and invalidate unwhitened resume."""
+
+        base = ["recon", "--twix", "input.dat", "--seq", "input.seq", "--out", "out"]
+        with mock.patch.object(sys, "argv", base):
+            self.assertFalse(reconstruction._parse_cli_args().prewhiten)
+        with mock.patch.object(sys, "argv", base + ["--prewhiten"]):
+            self.assertTrue(reconstruction._parse_cli_args().prewhiten)
+        default = reconstruction._bart_coil_calibration_provenance(0.8, 20)
+        whitened = reconstruction._bart_coil_calibration_provenance(0.8, 20, True)
+        self.assertNotIn("noise_prewhitening", default)
+        self.assertTrue(whitened["noise_prewhitening"]["enabled"])
+
     def test_espirit_crop_is_accepted_by_the_integrated_cli(self) -> None:
         """The top-level crop option should configure either reconstruction backend."""
         argv = [
@@ -74,6 +87,40 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
         ]
         with mock.patch.object(sys, "argv", argv):
             self.assertEqual(reconstruction._parse_cli_args().espirit_crop, 0.5)
+
+    def test_nowave_runtime_accepts_wavelet_regularization(self) -> None:
+        """No-wave runtime configuration should accept a custom PICS weight."""
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            twix = root / "input.dat"
+            sequence = root / "input.seq"
+            twix.touch()
+            sequence.touch()
+            argv = [
+                "recon",
+                "--twix",
+                str(twix),
+                "--seq",
+                str(sequence),
+                "--out",
+                str(root / "out"),
+                "--wave-mode",
+                "nowave",
+                "--wavelet-regularization",
+                "0.002",
+            ]
+            mode_sequence = mock.Mock()
+            mode_sequence.definitions = {}
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                reconstruction.pp, "Sequence", return_value=mode_sequence
+            ), mock.patch.object(
+                reconstruction, "_resolve_mprage_wave_mode", return_value="nowave"
+            ):
+                runtime = reconstruction._collect_runtime_config()
+
+            self.assertEqual(runtime["tag_wave"], "nowave")
+            self.assertEqual(runtime["wavelet_regularization"], 0.002)
 
     def test_virtual_coil_count_accepts_all_supported_cli_names(self) -> None:
         """Canonical and compatibility names should configure the same value."""
@@ -143,6 +190,34 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
                 (Path(folder) / "coil_compression_energy_nccall_roimgcrop.npy").is_file()
             )
 
+    def test_prewhitening_precedes_identity_or_pca_coil_basis(self) -> None:
+        """The saved streaming basis should include whitening before VCC."""
+
+        integrated_ref = torch.ones((8, 2, 2, 5, 3), dtype=torch.complex64)
+        whitener = np.diag([1.0, 2.0, 3.0]).astype(np.complex64)
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(
+            reconstruction,
+            "load_ref_set",
+            return_value=integrated_ref[:, :, :, -1, :],
+        ), mock.patch.object(reconstruction, "estimate_cc_matrix_coillast") as estimate:
+            basis, _, _ = reconstruction.load_or_generate_coil_compression_for_bart(
+                mprage_data_file="unused.dat",
+                os_factor=2,
+                out_folder=folder + "/",
+                file_tag="",
+                Nacs=2,
+                ncc=0,
+                noise_whitener=whitener,
+            )
+            estimate.assert_not_called()
+            np.testing.assert_array_equal(basis, whitener)
+            self.assertTrue(
+                (
+                    Path(folder)
+                    / "coil_compression_energy_nccall_prewhiten-v1_roimgcrop.npy"
+                ).is_file()
+            )
+
     def test_integrated_bart_runner_uses_wrapper_defaults_and_skips_nifti(self) -> None:
         """The default backend should invoke BART without running local CG-SENSE."""
 
@@ -178,6 +253,46 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
         )
         run.assert_called_once_with(command, check=True)
 
+    def test_integrated_bart_runner_forwards_wavelet_regularization(self) -> None:
+        """The integrated CLI should pass a requested BART wavelet weight."""
+
+        with mock.patch.object(reconstruction.subprocess, "run") as run:
+            reconstruction._run_bart_reconstruction(
+                bart_input_folder=Path("inputs"),
+                bart_output_folder=Path("outputs"),
+                twix_file=Path("input.dat"),
+                seq_file=Path("input.seq"),
+                save_nifti=False,
+                save_nifti_phase=False,
+                nifti_out_folder=Path("nifti"),
+                nifti_sub=None,
+                nifti_suffix="MPRAGE",
+                nifti_axis_roles=("phase", "readout", "slice"),
+                nifti_axis_flips=(True, False, False),
+                twix_coord_system="LPS",
+                twix_inplane_rot_sign=-1.0,
+                twix_use_fov_for_voxel_size=False,
+                file_tag="",
+                yflip=-1,
+                zflip=-1,
+                wavelet_regularization=0.002,
+            )
+        command = run.call_args.args[0]
+        self.assertNotIn("--resume", command)
+        start = command.index("--wave-options")
+        self.assertEqual(
+            command[start : start + 7],
+            [
+                "--wave-options",
+                "-w",
+                "-r",
+                "0.002",
+                "-f",
+                "-g",
+                "--end-wave-options",
+            ],
+        )
+
     def test_integrated_cartesian_runner_uses_wrapper_defaults(self) -> None:
         """The no-wave runner should delegate PICS options to its GPU wrapper."""
 
@@ -211,6 +326,52 @@ class MprageCalibrationPipelineTests(unittest.TestCase):
         self.assertEqual(
             command[ecalib_start : ecalib_start + 4],
             ["--ecalib-options", "-c", "0.5", "--end-ecalib-options"],
+        )
+
+    def test_integrated_cartesian_runner_forwards_wavelet_regularization(self) -> None:
+        """The no-wave runner should pass a custom PICS L1 weight."""
+
+        with mock.patch.object(reconstruction.subprocess, "run") as run:
+            reconstruction._run_bart_cartesian_reconstruction(
+                bart_input_folder=Path("inputs"),
+                bart_output_folder=Path("outputs"),
+                twix_file=Path("input.dat"),
+                seq_file=Path("input.seq"),
+                save_nifti=False,
+                save_nifti_phase=False,
+                nifti_out_folder=Path("nifti"),
+                nifti_sub=None,
+                nifti_suffix="MPRAGE",
+                nifti_axis_roles=("phase", "readout", "slice"),
+                nifti_axis_flips=(True, False, False),
+                twix_coord_system="LPS",
+                twix_inplane_rot_sign=-1.0,
+                twix_use_fov_for_voxel_size=False,
+                file_tag="",
+                yflip=-1,
+                zflip=-1,
+                resume=True,
+                wavelet_regularization=0.002,
+            )
+
+        command = run.call_args.args[0]
+        self.assertNotIn("--resume", command)
+        start = command.index("--pics-options")
+        self.assertEqual(
+            command[start : start + 11],
+            [
+                "--pics-options",
+                "-l1",
+                "-r",
+                "0.002",
+                "--fista",
+                "-i",
+                "300",
+                "-g",
+                "-S",
+                "--end-pics-options",
+                "--skip-nifti",
+            ],
         )
         run.assert_called_once_with(command, check=True)
 
